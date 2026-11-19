@@ -14,7 +14,10 @@ const STATS_KEEP_MS = 90 * 24 * 60 * 60 * 1000 // a chat's /cmaxx-stats counts (
 const TOMBSTONE_MS = 365 * 24 * 60 * 60 * 1000 // a retired chat's marker, so a resume doesn't read its history again
 const DAY_MS = 24 * 60 * 60 * 1000
 const MAX_READ = 4 * 1024 * 1024 // $.fs.read refuses bigger files
-const REPO_RAW = 'https://raw.githubusercontent.com/5m0k3/cache-maxxing/main'
+// This fork's own releases: /cmaxx-update reads the version from here. The price list stays upstream's,
+// where it is maintained; it is the same table for both.
+const FORK_RAW = 'https://raw.githubusercontent.com/Mixonn/cache-maxxing/main'
+const PRICES_RAW = 'https://raw.githubusercontent.com/5m0k3/cache-maxxing/main'
 const SEED_MS = 30_000 // a handoff line older than this is stale: a later /clear of your own gets an empty box
 // An error for a reply: its message only, never a cut-off "Error: …" dump
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err)).slice(0, 200)
@@ -517,7 +520,7 @@ export const register: Register = (on, options) => {
   // updater where the plugin may run it (the terminal); otherwise the reply says how.
   on('command.run', { command: 'cmaxx-update' }, async $ => {
     const get = async (file: string) => {
-      const r = await $.http.fetch(`${REPO_RAW}/${file}`).catch((err: unknown) => {
+      const r = await $.http.fetch(`${file === 'prices.json' ? PRICES_RAW : FORK_RAW}/${file}`).catch((err: unknown) => {
         $.ui.log(`cache-maxxing: /cmaxx-update fetch ${file}: ${String(err)}`, { to: 'debug' })
         throw new Error('GitHub not reachable (offline?)') // the raw error went to the debug log
       })

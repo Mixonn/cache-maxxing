@@ -6,7 +6,7 @@
 
 **See when Claude's prompt cache expires, and what your next message will cost, before you send it.**
 
-[![version](https://img.shields.io/badge/version-0.7.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.7.1-blue)](CHANGELOG.md)
 [![license: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-orange)](https://code.claude.com/docs/en/discover-plugins)
 
@@ -16,7 +16,7 @@
 
 ## About
 
-> **This is a fork** of [5m0k3/cache-maxxing](https://github.com/5m0k3/cache-maxxing). It adds one thing: **auto-compact**. A big chat whose work is not finished compacts itself shortly before its cache expires (or when your usage limit is nearly reached), so the chat you come back to is small and cheap to continue. Everything else is the original plugin.
+> **This is a fork** of [5m0k3/cache-maxxing](https://github.com/5m0k3/cache-maxxing). It adds two things: **auto-compact** (a big chat whose work is not finished compacts itself shortly before its cache expires, or when your usage limit is nearly reached, so the chat you come back to is small and cheap to continue) and a **🔄 Handoff** button on the 🔴 bar. `/cmaxx-update` checks this fork's version; the price list still comes from the original, where it is maintained. Everything else is the original plugin.
 
 Ever feel like your Claude subscription quota disappears way faster than it should? Usually, it's not how **much** you're building - it's **when** you hit Send.
 
@@ -55,19 +55,19 @@ Claude keeps your chat "warm" only for a while so follow-up messages barely dent
 Requires a recent Claude Code: the desktop app, the VS Code extension, or the CLI. It's tested on 2.1.325 and later.
 
 **Any application**  
-Just paste this repository's link (https://github.com/5m0k3/cache-maxxing) in the chat window and ask Claude to install it for you.
+Just paste this repository's link (https://github.com/Mixonn/cache-maxxing) in the chat window and ask Claude to install it for you.
 
 or see below for your specific application:
 
 **Desktop app**
 1. Click **+** next to the chat box, then **Plugins** → **Manage Plugins**.
-2. On top right press **+ Add** → **Add marketplace** → **Add from a repository** and enter `5m0k3/cache-maxxing`.
+2. On top right press **+ Add** → **Add marketplace** → **Add from a repository** and enter `Mixonn/cache-maxxing`. Remove the original cache-maxxing first: both are named the same.
 3. **Add plugin** → cache-maxxing.
 
 **Terminal or VS Code** (at the Claude Code prompt)
 
 ```
-/plugin install cache-maxxing --marketplace 5m0k3/cache-maxxing
+/plugin install cache-maxxing --marketplace Mixonn/cache-maxxing
 ```
 
 Answer `y` to add the marketplace and press Enter for the user scope. The bar shows after your next message (may need a restart).
@@ -175,7 +175,7 @@ What it costs: Haiku's judgment is a fraction of a cent. The compaction is done 
 - **Auto-compact calls models by itself, unless you turn it off.** It sends Claude Haiku an abbreviated copy of the chat's last 30 messages (long ones cut, tool output left out) to judge whether the work is finished. If it is not, the chat is compacted exactly as `/compact` would: the chat's own model summarizes it.
 - **Two commands reach outside, when you run them:**
   - `/cmaxx-handoff` sends Claude Haiku an abbreviated copy of the chat (the last 120 messages, long ones cut, tool output left out). The briefing is saved in your project under `.claude/handoffs/`, which gets its own `.gitignore`, so briefings are never committed.
-  - `/cmaxx-update` downloads this plugin's version number and price list from this repository and sends nothing. GitHub sees your IP address, as for any download.
+  - `/cmaxx-update` downloads this fork's version number (from `Mixonn/cache-maxxing`) and the price list (from the original `5m0k3/cache-maxxing`) and sends nothing. GitHub sees your IP address, as for any download.
 - **Stored on your computer:** a small record per chat (time of the last reply, chat size, model) for 7 days, and counts for `/cmaxx-stats` (numbers only, each chat's for 90 days, the totals for good). **Never the chat's text!**
 
 ## Limitations

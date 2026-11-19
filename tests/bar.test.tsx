@@ -632,7 +632,8 @@ test('update, same version: only this repo\'s files are read, and a new model is
   const t = await runUpdate($)
   expect(t).toBe('cache-maxxing 0.4.0 is the latest version. Prices updated to 2026-12-02: new claude-opus-6.')
   expect(u.calls.argv).toEqual([])
-  expect(u.calls.urls.every(x => x.startsWith('https://raw.githubusercontent.com/5m0k3/cache-maxxing/main/'))).toBe(true)
+  // the version from this fork, the price list from upstream, where it is maintained
+  expect(u.calls.urls).toEqual(['https://raw.githubusercontent.com/Mixonn/cache-maxxing/main/.claude-plugin/plugin.json', 'https://raw.githubusercontent.com/5m0k3/cache-maxxing/main/prices.json'])
   await u.reply($, { read: 50_000, write: 0, model: 'claude-opus-6' })
   await expectBar($, '🟢 60 min left · next message ≈ $0.03 · 50K / 1M · ✅ Keep going')
   expect(await runUpdate($)).toContain('Prices: up to date (2026-12-02).')

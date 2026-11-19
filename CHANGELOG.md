@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.7.1] - fork: updates from the fork
+
+### Changed
+- `/cmaxx-update` checks this fork's version (`Mixonn/cache-maxxing`), so it offers the fork's releases instead of saying an older upstream version is the latest. The price list is still downloaded from the original repository, where it is maintained.
+- The README's install steps point at the fork.
+
 ## [0.7.0] - fork: handoff button
 
 ### Added
