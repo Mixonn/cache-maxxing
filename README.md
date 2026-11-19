@@ -6,7 +6,7 @@
 
 **See when Claude's prompt cache expires, and what your next message will cost, before you send it.**
 
-[![version](https://img.shields.io/badge/version-0.7.1-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.7.2-blue)](CHANGELOG.md)
 [![license: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-orange)](https://code.claude.com/docs/en/discover-plugins)
 

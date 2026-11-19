@@ -19,8 +19,10 @@ type Usage = { read: number; write: number; out?: number; model?: string; ttl?: 
 
 // The engine beneath the plugin (one chat, Opus 5.5, 1M window). Every stand-in is
 // registered here, before the test's first call on $, as the kit requires.
-function engine(on: On, opts: { store?: Record<string, unknown>; sets?: { key: string; value: unknown }[]; state?: unknown; streamMs?: number; brokenStore?: boolean; now?: number; contextTokens?: number } = {}) {
+function engine(on: On, opts: { store?: Record<string, unknown>; sets?: { key: string; value: unknown }[]; state?: unknown; streamMs?: number; brokenStore?: boolean; now?: number; contextTokens?: number; surfaces?: string[] } = {}) {
   const clock = mock.clock(on, { now: opts.now ?? T0 })
+  // the surfaces drawing the chat; the desktop app and VS Code attach theirs after session.start
+  if (opts.surfaces) { const surfaces = opts.surfaces; on('session.surfaces', () => ({ value: surfaces }) as never) }
   if (opts.brokenStore) for (const k of ['store.get', 'store.set', 'store.delete', 'store.keys'] as const) on(k, () => { throw new Error('store broken') })
   else if (opts.sets) {
     // a store in memory that also records every write (mock.store hands nothing back)
@@ -694,6 +696,17 @@ test('claude -p and other non-interactive sessions are not counted', async ($, o
   expect(await stats($)).toContain('| Replies | 0 | 0 |')
 })
 
+// The desktop app and VS Code drive Claude Code the way the SDK does: session.start says the
+// session is not interactive and names no surface; the app's window attaches right after.
+const desktopStart = ($: Dollar) => $.session.start({ cwd: '/', isInteractive: false } as never)
+
+test('desktop app: not interactive at session.start, but its window is attached: the chat is counted', async ($, on) => {
+  const w = engine(on, { surfaces: ['desktop'] })
+  await desktopStart($)
+  await w.reply($, { read: 0, write: 50_000 })
+  expect(await stats($)).toContain('| Replies | 1 | 1 |')
+})
+
 test('a fork does not read its transcript (the parent\'s rows): counted from its first reply', async ($, on) => {
   const w = engine(on)
   const reads = onDisk(on, 1_000)
@@ -815,8 +828,8 @@ test('update: when Claude Code says it is already at the latest, the reply never
 
 // --- auto-compact (0.6.0) ----------------------------------------------------------
 // The chat, Haiku and the engine's compaction are stand-ins; the ticker and the gate are real.
-function autoEngine(on: On, opts: { judgment?: string | null; compactRejects?: number; veto?: boolean; store?: Record<string, unknown>; sets?: { key: string; value: unknown }[] } = {}) {
-  const w = engine(on, { store: opts.store, sets: opts.sets })
+function autoEngine(on: On, opts: { judgment?: string | null; compactRejects?: number; veto?: boolean; store?: Record<string, unknown>; sets?: { key: string; value: unknown }[]; surfaces?: string[] } = {}) {
+  const w = engine(on, { store: opts.store, sets: opts.sets, surfaces: opts.surfaces })
   const calls = { judgments: [] as { model: string; system?: unknown; prompt: unknown; effort?: string; maxTokens?: number }[], compacts: [] as { instructions?: string }[], notices: [] as string[] }
   on('session.messages', () => ({ value: [
     { role: 'user', text: 'make the tests pass', toolUses: [] },
@@ -862,6 +875,24 @@ test('auto-compact: an unfinished chat is compacted once, 5 minutes before its c
   expect(a.calls.judgments.length).toBe(1)
   expect(a.calls.compacts.length).toBe(1)
   expect(String((await $.command.run({ command: 'cmaxx-stats', args: '' } as never)).text)).toContain('| Auto-compacts | 1 | 1 |')
+})
+
+test('auto-compact: works in the desktop app, where session.start says not interactive', async ($, on) => {
+  const a = autoEngine(on, { surfaces: ['desktop'] })
+  await desktopStart($)
+  await a.reply($, { read: 300_000, write: 0 })
+  await a.clock.advance(55 * MIN + 2_000)
+  expect(a.calls.judgments.length).toBe(1)
+  expect(a.calls.compacts.length).toBe(1)
+})
+
+test('auto-compact: never in claude -p or a bare SDK host (not interactive, nothing attached)', async ($, on) => {
+  const a = autoEngine(on, { surfaces: [] })
+  await desktopStart($)
+  await a.reply($, { read: 300_000, write: 0 })
+  await a.clock.advance(55 * MIN + 2_000)
+  expect(a.calls.judgments.length).toBe(0)
+  expect(a.calls.compacts.length).toBe(0)
 })
 
 test('auto-compact: a finished chat is left alone, and judged only once', async ($, on) => {

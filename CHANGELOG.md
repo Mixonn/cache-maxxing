@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.7.2] - fork: auto-compact and stats in the desktop app
+
+### Fixed
+- Auto-compact never ran in the desktop app, and `/cmaxx-stats` never counted a reply there. The app drives Claude Code the way the SDK does: `session.start` says the session is not interactive and names no surface, and the app's window attaches right after. The plugin took that first word for `claude -p` and left every desktop chat alone. A session now counts as a chat when the engine says it is interactive or once any surface is attached; `claude -p` and a bare SDK host, with nothing attached, are still left alone.
+
 ## [0.7.1] - fork: updates from the fork
 
 ### Changed

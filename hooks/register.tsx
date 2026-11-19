@@ -122,8 +122,19 @@ async function prune($: EngineInterface) {
 const pending = new Map<string, Partial<Stats>>()
 let isInteractive = true // claude -p, the SDK and observer sessions aren't counted
 
+// The desktop app and VS Code drive Claude Code the way the SDK does: session.start says the
+// session is not interactive and names no surface, and the app's window attaches right after
+// (measured on 2.1.325; the handoff already relies on `surfaces()` listing 'desktop', F52). So a session is a chat when the engine says so, or once any surface is
+// attached to draw it; claude -p and a bare SDK host never have one. A yes is kept for good.
+async function isChat($: EngineInterface): Promise<boolean> {
+  if (isInteractive) return true
+  const surfaces = await $.session.surfaces().catch(() => [] as readonly string[])
+  if (surfaces.length > 0) isInteractive = true
+  return isInteractive
+}
+
 async function count($: EngineInterface, d: Partial<Stats>, sessionId?: string) {
-  if (!isInteractive) return
+  if (!(await isChat($))) return
   const key = `st:${sessionId ?? (await $.session.id())}`
   pending.set(key, addStats(pending.get(key), d, 0))
 }
@@ -212,7 +223,7 @@ async function autoCompact($: EngineInterface, rec: Rec, settings: Settings) {
 // (4 MiB at most, $.fs.read's limit), adding only what live counting hasn't already. Too big to
 // read: counted from now on, and /cmaxx-stats says "since <date>".
 async function fillIn($: EngineInterface, sessionId: string, path: string | undefined, ttlMin: number, isFork: boolean) {
-  if (!isInteractive || !path) return
+  if (!path || !(await isChat($))) return
   const key = `st:${sessionId}`
   const have = (await $.store.get(key)) as Stats | undefined
   if (have?.isFilled || have?.partialSince) return
@@ -346,7 +357,7 @@ export const register: Register = (on, options) => {
           if (now && now.at === rec.at) await $.store.set(`cmx:${await $.session.id()}`, now).catch(() => {})
         }
         // auto-compact: a big unfinished chat, while its cache is still warm
-        if (!settings.autoCompact || !isInteractive || isAutoBusy) return
+        if (!settings.autoCompact || isAutoBusy || !(await isChat($))) return
         if (at - readingAt >= SHARED_READING_MS) {
           readingAt = at
           reading = newerReading(ownReading, await $.store.get('rl').catch(() => undefined))
@@ -422,7 +433,7 @@ export const register: Register = (on, options) => {
       })
       if (isNewChat) {
         isNewChat = false
-        if (isInteractive) {
+        if (await isChat($)) {
           const had = await $.store.get('fresh').catch(() => undefined)
           const fresh = [...(Array.isArray(had) ? had : []), u.cache_creation_input_tokens].slice(-FRESH_SAMPLES)
           setFreshStart(fresh)

@@ -1,6 +1,6 @@
 {
   "name": "cache-maxxing",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Shows how long Claude's chat memory (prompt cache) stays active and what your next message costs, and compacts big unfinished chats on its own before that memory expires",
   "types": "./types/index.d.ts",
   "userConfig": {
