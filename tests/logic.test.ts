@@ -3,7 +3,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { Rec } from '../types'
-import { DEFAULTS, HAIKU_ESTIMATE, PRICES_DATE, addStats, clock, costs, decide, emptyStats, fromSessionStart, haikuUsd, money, newerVersion, priceOf, sendWarning, setPriceOverride, statsFromTranscript, statsText, isDevCopy, isNewModel, sumStats, tokens, ttlFor, validatePrices } from '../hooks/logic'
+import { DEFAULTS, HAIKU_ESTIMATE, autoCompactDue, autoCompactNotice, newerReading, parseJudgment, readSettings, PRICES_DATE, addStats, clock, costs, decide, emptyStats, fromSessionStart, haikuUsd, money, newerVersion, priceOf, sendWarning, setPriceOverride, statsFromTranscript, statsText, isDevCopy, isNewModel, sumStats, tokens, ttlFor, validatePrices } from '../hooks/logic'
 import { savingsLine } from '../hooks/handoff'
 
 const MIN = 60_000
@@ -197,6 +197,7 @@ test('stats: counts add up, junk counts as empty, the table puts this chat and a
     '| Tokens saved | 183K | 183K |',
     '| Cache hit rate | 90% | 95% |',
     '| Handoffs | 1 | 1 |',
+    '| Auto-compacts | 0 | 0 |',
     '| Cold rebuilds paid | 1 (228K tokens, $1.82) | 1 (228K tokens, $1.82) |',
     '| Replies | 1 | 5 |',
     '| Chats | – | 3 |',
@@ -305,4 +306,71 @@ test('All chats: every chat summed with the retired ones; a chat with no reply o
   const all = sumStats([a, empty, back], { ...emptyStats(now), replies: 5, chats: 2 }, now)
   expect(all.replies).toBe(9)
   expect(all.chats).toBe(3)
+})
+
+// --- auto-compact (0.5.0) ----------------------------------------------------------
+// rec() is a 228K Opus 5.5 chat whose last reply started at 0, on the 1h cache.
+const S = { ...DEFAULTS }
+const at = (minLeft: number) => 60 * MIN - minLeft * MIN
+const reading = (percentUsed: number, resetsAt?: string, kind = 'five_hour') => ({ at: 0, limits: [{ kind, percentUsed, resetsAt }] })
+
+test('auto-compact: the cache trigger fires from 5 minutes left down to 60 seconds, never after', async () => {
+  expect(autoCompactDue(rec(), at(6), S, null)).toBe(null)
+  expect(autoCompactDue(rec(), at(5), S, null)).toBe('cache')
+  expect(autoCompactDue(rec(), at(1), S, null)).toBe('cache')
+  expect(autoCompactDue(rec(), at(0.9), S, null)).toBe(null) // a compaction started now may not finish in time
+  expect(autoCompactDue(rec(), at(-1), S, null)).toBe(null) // expired: the Mac woke up too late
+})
+
+test('auto-compact: never when off, on the 5m cache, on a small chat or after a cache reset', async () => {
+  expect(autoCompactDue(rec(), at(5), { ...S, autoCompact: false }, null)).toBe(null)
+  expect(autoCompactDue(rec({ ttlMin: 5 }), 2 * MIN, S, null)).toBe(null)
+  expect(autoCompactDue(rec({ prefix: 20_000 }), at(5), S, null)).toBe(null) // $0.16 rebuild, under the limit
+  expect(autoCompactDue(rec({ resetBy: 'compact' }), at(5), S, null)).toBe(null)
+  expect(autoCompactDue(rec({ resetBy: 'model' }), at(5), S, null)).toBe(null)
+})
+
+test('auto-compact: a reply is judged once; only a pending compaction comes back', async () => {
+  expect(autoCompactDue(rec({ auto: 'judged' }), at(5), S, null)).toBe(null)
+  expect(autoCompactDue(rec({ auto: 'compacted' }), at(5), S, null)).toBe(null)
+  expect(autoCompactDue(rec({ auto: 'due' }), at(5), S, null)).toBe('cache')
+})
+
+test('auto-compact: the limit trigger fires at 93% of the 5-hour or weekly window, while the cache is warm', async () => {
+  expect(autoCompactDue(rec(), at(40), S, reading(93))).toBe('limit')
+  expect(autoCompactDue(rec(), at(40), S, reading(95, undefined, 'seven_day'))).toBe('limit')
+  expect(autoCompactDue(rec(), at(40), S, reading(92.9))).toBe(null)
+  expect(autoCompactDue(rec(), at(40), S, reading(100))).toBe(null) // a used-up window cannot pay for a compaction
+  expect(autoCompactDue(rec(), at(40), S, reading(99, new Date(at(41)).toISOString()))).toBe(null) // that window has reset since
+  expect(autoCompactDue(rec(), at(40), S, reading(99, new Date(at(10)).toISOString()))).toBe('limit')
+  expect(autoCompactDue(rec(), at(40), S, reading(99, undefined, 'spend_limit'))).toBe(null)
+  expect(autoCompactDue(rec(), at(40), { ...S, autoCompactLimitPercent: 80 }, reading(85))).toBe('limit')
+  expect(autoCompactDue(rec(), at(-1), S, reading(99))).toBe(null)
+  expect(autoCompactDue(rec(), at(40), S, { at: 0, limits: [] })).toBe(null)
+})
+
+test('auto-compact: the newer of two limit readings wins; junk is no reading', async () => {
+  expect(newerReading(null, undefined)).toBe(null)
+  expect(newerReading({ at: 1, limits: [] }, { at: 2, limits: [] })?.at).toBe(2)
+  expect(newerReading({ at: 3, limits: [] }, { at: 2, limits: [] })?.at).toBe(3)
+  expect(newerReading({ at: 'x' }, { at: 2, limits: [{ kind: 'five_hour', percentUsed: 9 }] })?.at).toBe(2)
+  expect(newerReading({ at: 5, limits: [{ kind: 'five_hour', percentUsed: 'many' }, { kind: 'seven_day', percentUsed: 4 }] }, null)?.limits).toEqual([{ kind: 'seven_day', percentUsed: 4 }])
+})
+
+test("auto-compact: Haiku's one word, or nothing", async () => {
+  expect(parseJudgment('UNFINISHED')).toBe('unfinished')
+  expect(parseJudgment('finished.')).toBe('finished')
+  expect(parseJudgment('The work is UNFINISHED because tests fail')).toBe('unfinished')
+  expect(parseJudgment('I cannot tell')).toBe(null)
+  expect(parseJudgment('')).toBe(null)
+})
+
+test('auto-compact: the notice says what happened, why, and how to turn it off', async () => {
+  expect(autoCompactNotice('cache', 290_000, 31_000)).toBe("cache-maxxing compacted this chat on its own (290K → 31K): its cache was about to expire and the work looked unfinished. Turn this off in the plugin's settings (Auto-compact).")
+  expect(autoCompactNotice('limit', 290_000)).toBe("cache-maxxing compacted this chat on its own (290K before): your usage limit is nearly reached and the work looked unfinished. Turn this off in the plugin's settings (Auto-compact).")
+})
+
+test('auto-compact: settings default to on, 5 minutes and 93%', async () => {
+  expect(readSettings({})).toMatchObject({ autoCompact: true, autoCompactMinutes: 5, autoCompactLimitPercent: 93 })
+  expect(readSettings({ autoCompact: 'off', autoCompactMinutes: 10, autoCompactLimitPercent: '80' })).toMatchObject({ autoCompact: false, autoCompactMinutes: 10, autoCompactLimitPercent: 80 })
 })
