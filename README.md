@@ -140,6 +140,27 @@ Afterwards the chat holds a notice: `cache-maxxing compacted this chat on its ow
 
 What it costs: Haiku's judgment is a fraction of a cent. The compaction is done by the chat's own model and reads the still-active cache, so it uses about as much of your limit as one normal message.
 
+### What happens when
+
+| Situation | What auto-compact does |
+|---|---|
+| You leave a big chat mid-task | With 5 minutes left on the cache, Haiku judges it unfinished and the chat is compacted. You come back to a small chat with a notice in it. |
+| Claude asked you a question and you left | Same: waiting for your answer counts as unfinished. |
+| The work is done (request answered, pull request opened) | Judged once, left alone. The cache expires and the bar turns 🔴 as before; `/cmaxx-handoff` is there if you need the chat again. |
+| The chat is small (rebuild under the rebuild limit) | Never judged, never compacted: rebuilding it is cheap anyway. |
+| You reply before the 5-minute mark | Nothing happens. The reply restarts the hour, and that reply gets its own judgment later. |
+| Your 5-hour or weekly limit reaches 93% | Every open, big, unfinished chat whose cache is still active is judged and compacted right away, however much cache time is left. An idle chat learns of the limit within 30 seconds of the chat that hit it. |
+| The limit is already at 100%, or that window has reset since | Nothing: a used-up window cannot pay for a compaction, and a reset window is no reason for one. |
+| Haiku is unavailable or gives no clear answer | Nothing, and it is not asked again about that reply. |
+| A turn is running when the compaction starts | The compaction is refused and retried every 5 seconds, without asking Haiku again, until a minute before the cache expires. |
+| Another plugin's hook vetoes the compaction | It is not tried again for that reply. |
+| The computer sleeps, or the app or the chat is closed | Nothing runs. Waking up with more than a minute of cache left carries on as above; waking up after the cache expired leaves the chat as it is. |
+| The chat was just compacted (by you or by auto-compact), or you switched model | Nothing until your next reply: the cache is already gone, and the chat is already small. |
+| The chat grows big again after an auto-compact | It can be auto-compacted again, after a later reply, by the same rules. |
+| API key, cloud provider or usage credits (5-minute cache) | Never: five minutes is too short to act on. |
+| `claude -p`, the SDK, subagents | Never. |
+| Auto-compact is `off` | Never; the rest of the plugin works as in the original. |
+
 ## Privacy
 
 - **The bar itself sends nothing anywhere.** Everything it shows is worked out on your computer.
