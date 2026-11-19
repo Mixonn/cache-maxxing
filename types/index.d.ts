@@ -13,6 +13,9 @@ export type Rec = {
   window?: number // the model's context window in tokens
   resetBy?: 'model' | 'compact' // cache gone before its time ran out; cleared by the next reply
   isEstimate?: boolean // filled in from session-start data, not from a reply this plugin saw
+  // auto-compact's verdict on this reply: judged = finished, or Haiku gave no usable answer (never asked
+  // again); due = unfinished, compaction still pending; compacted = done. A new reply starts without one.
+  auto?: 'judged' | 'due' | 'compacted'
 }
 
 declare module 'claude-code' {

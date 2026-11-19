@@ -4,10 +4,10 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Rec } from '../types'
-import { assembleBrief, briefPrompt, extractFacts, handoffPath, isValidBrief, parseSkill, savingsLine, seedLine, transcriptGuess } from './handoff'
+import { assembleBrief, briefPrompt, extractFacts, handoffPath, isValidBrief, parseSkill, renderTranscript, savingsLine, seedLine, transcriptGuess } from './handoff'
 import type { Numbers } from './handoff'
-import { PRICES_DATE, WAITING, isDevCopy, addStats, bundledPrices, costs, decide, fromSessionStart, haikuUsd, handoffSaving, newerVersion, priceOf, readSettings, sendWarning, setFreshStart, setPriceOverride, statsFromTranscript, statsText, sumStats, ttlFor, ttlFromUsage, validatePrices } from './logic'
-import type { Stats } from './logic'
+import { COMPACT_INSTRUCTIONS, JUDGE_CLOSING, JUDGE_SYSTEM, PRICES_DATE, WAITING, autoCompactDue, autoCompactNotice, newerReading, parseJudgment, isDevCopy, addStats, bundledPrices, costs, decide, fromSessionStart, haikuUsd, handoffSaving, newerVersion, priceOf, readSettings, sendWarning, setFreshStart, setPriceOverride, statsFromTranscript, statsText, sumStats, ttlFor, ttlFromUsage, validatePrices } from './logic'
+import type { LimitReading, Settings, Stats } from './logic'
 
 const KEEP_MS = 7 * 24 * 60 * 60 * 1000 // saved chats older than this are pruned; an older chat refills on resume
 const STATS_KEEP_MS = 90 * 24 * 60 * 60 * 1000 // a chat's /cmaxx-stats counts (your call); then folded into st:retired
@@ -136,6 +136,72 @@ async function flush($: EngineInterface) {
   }
 }
 
+// --- auto-compact (0.6.0) ----------------------------------------------------------
+// The rate-limit windows: this chat's own last reading, and the newest any chat shared in
+// $.store (`rl`). An idle chat's own reading is as old as its last reply.
+const SHARED_READING_MS = 30_000 // how often an idle chat looks at the shared reading
+const AUTO_RETRY_MS = 5_000 // between attempts: a refused compaction (a turn is running) is tried again
+const JUDGE_MESSAGES = 30 // your call: the tail Haiku reads to judge "finished"; the handoff reads 120
+const JUDGE_CHARS = 40_000
+let ownReading: LimitReading | null = null
+let reading: LimitReading | null = null
+let readingAt = 0
+let isAutoBusy = false
+let autoTriedAt = 0
+
+// Marks the live record, only while it is still the reply that was judged.
+async function markAuto($: EngineInterface, at: number, patch: Partial<Rec>) {
+  await update($, last, r => (r && r.at === at ? { ...r, ...patch } : r))
+  const now = await read($, last)
+  if (now && now.at === at) await $.store.set(`cmx:${await $.session.id()}`, now).catch(() => {})
+  return now && now.at === at ? now : null
+}
+
+// Asks Haiku once whether the work is finished, then compacts an unfinished chat in place.
+// Every way out leaves a mark on the record, so the ticker never asks twice about one reply.
+async function autoCompact($: EngineInterface, rec: Rec, settings: Settings) {
+  const log = (text: string) => $.ui.log(`cache-maxxing: auto-compact ${text}`, { to: 'debug' })
+  if (rec.auto !== 'due') {
+    // marked before the model call: an error or a restart mid-way must not ask again
+    if (!(await markAuto($, rec.at, { auto: 'judged' }))) return
+    const r = await $.model.complete({
+      model: 'haiku',
+      system: JUDGE_SYSTEM,
+      prompt: `${renderTranscript((await $.session.messages()).slice(-JUDGE_MESSAGES)).slice(-JUDGE_CHARS)}\n\n---\n\n${JUDGE_CLOSING}`,
+      effort: 'low',
+      maxTokens: 200,
+      timeoutMs: 30_000,
+    })
+    const verdict = parseJudgment(r.isAnswered ? r.text : '')
+    if (verdict !== 'unfinished') return log(verdict ? 'skipped: the work looks finished' : `skipped: no judgment (${r.isAnswered ? 'unclear answer' : r.reason})`)
+    if (!(await markAuto($, rec.at, { auto: 'due' }))) return
+  }
+  // Haiku took a while: only if this is still the same reply and its cache is still warm enough
+  const live = await read($, last)
+  const why = live && live.at === rec.at ? autoCompactDue(live, await $.clock.now(), settings, reading) : null
+  if (!live || !why) return
+  let res
+  try {
+    res = await $.session.compact({ instructions: COMPACT_INSTRUCTIONS })
+  } catch (err) {
+    return log(`refused, will retry: ${String(err)}`) // a turn is running: the record stays due
+  }
+  if (res.skip !== undefined) {
+    await markAuto($, rec.at, { auto: 'judged' })
+    return log(`vetoed: ${res.skip}`)
+  }
+  // classic.PostCompact has usually re-priced the record already; this holds either way
+  const after = res.tokensAfter ?? (await read($, last))?.prefix
+  const isSmaller = after !== undefined && after < live.prefix
+  await markAuto($, rec.at, { auto: 'compacted', resetBy: 'compact', out: 0, warned: false, ...(isSmaller ? { prefix: after } : {}) })
+  const text = autoCompactNotice(why, live.prefix, isSmaller ? after : undefined)
+  $.ui.toast(text)
+  // a notice row kept in the chat (the model never reads it): it is there when the user comes back
+  await $.session.append({ message: { type: 'system', content: [{ type: 'text', text }] } }).catch(() => {})
+  await count($, { autoCompacts: 1 }).catch(() => {})
+  await flush($).catch(() => {})
+}
+
 // A chat this plugin hasn't counted from its start: read its history from the transcript once
 // (4 MiB at most, $.fs.read's limit), adding only what live counting hasn't already. Too big to
 // read: counted from now on, and /cmaxx-stats says "since <date>".
@@ -182,13 +248,29 @@ export const register: Register = (on, options) => {
         const rec = await read($, last)
         if (!rec) return
         await update($, tick, n => n + 1)
-        const v = decide(rec, await $.clock.now(), settings)
-        if (rec.warned || !v.shouldPopup || (await read($, hidden))) return
-        $.ui.toast(v.text) // the pop-up says exactly what the bar says
-        // only mark the record we judged: a reply saved meanwhile stays untouched
-        await update($, last, r => (r && r.at === rec.at ? { ...r, warned: true } : r))
-        const now = await read($, last)
-        if (now && now.at === rec.at) await $.store.set(`cmx:${await $.session.id()}`, now).catch(() => {})
+        const at = await $.clock.now()
+        const v = decide(rec, at, settings)
+        if (!rec.warned && v.shouldPopup && !(await read($, hidden))) {
+          $.ui.toast(v.text) // the pop-up says exactly what the bar says
+          // only mark the record we judged: a reply saved meanwhile stays untouched
+          await update($, last, r => (r && r.at === rec.at ? { ...r, warned: true } : r))
+          const now = await read($, last)
+          if (now && now.at === rec.at) await $.store.set(`cmx:${await $.session.id()}`, now).catch(() => {})
+        }
+        // auto-compact: a big unfinished chat, while its cache is still warm
+        if (!settings.autoCompact || !isInteractive || isAutoBusy) return
+        if (at - readingAt >= SHARED_READING_MS) {
+          readingAt = at
+          reading = newerReading(ownReading, await $.store.get('rl').catch(() => undefined))
+        }
+        if (!autoCompactDue(rec, at, settings, reading) || at - autoTriedAt < AUTO_RETRY_MS) return
+        isAutoBusy = true
+        autoTriedAt = at
+        try {
+          await autoCompact($, rec, settings)
+        } finally {
+          isAutoBusy = false
+        }
       })().catch(() => {})
     })
     void prune($).catch(() => {}) // in the background: never holds up the first prompt
@@ -312,6 +394,17 @@ export const register: Register = (on, options) => {
     }
     return next(e)
   }).catch(($, e, next) => next(e))
+
+  // The account's rate-limit windows, shared with this plugin's idle chats: each knows only
+  // what its own last reply reported, and the limit trigger needs the newest reading.
+  on('session.measure', async ($, e, next) => {
+    if (e.rateLimits?.length) {
+      ownReading = { at: await $.clock.now(), limits: e.rateLimits.map(l => ({ kind: l.kind, percentUsed: l.percentUsed, ...(l.resetsAt ? { resetsAt: l.resetsAt } : {}) })) }
+      reading = newerReading(ownReading, reading)
+      await $.store.set('rl', ownReading).catch(() => {})
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e)) // fail open: never get in Claude Code's way
 
   on('session.end', async ($, e, next) => {
     // the chat is leaving this process (clear, resume into another, exit): drop the

@@ -3,7 +3,7 @@
 // the SAME text, so a change made for VS Code or the terminal can't silently break desktop.
 import { expect, mock, test } from 'claude-code/testing'
 
-import { PRICES_DATE } from '../hooks/logic'
+import { PRICES_DATE, autoCompactNotice } from '../hooks/logic'
 
 const SURFACES = ['desktop', 'vscode', 'terminal'] as const
 const MIN = 60_000
@@ -19,10 +19,18 @@ type Usage = { read: number; write: number; out?: number; model?: string; ttl?: 
 
 // The engine beneath the plugin (one chat, Opus 5.5, 1M window). Every stand-in is
 // registered here, before the test's first call on $, as the kit requires.
-function engine(on: On, opts: { store?: Record<string, unknown>; state?: unknown; streamMs?: number; brokenStore?: boolean; now?: number; contextTokens?: number } = {}) {
+function engine(on: On, opts: { store?: Record<string, unknown>; sets?: { key: string; value: unknown }[]; state?: unknown; streamMs?: number; brokenStore?: boolean; now?: number; contextTokens?: number } = {}) {
   const clock = mock.clock(on, { now: opts.now ?? T0 })
   if (opts.brokenStore) for (const k of ['store.get', 'store.set', 'store.delete', 'store.keys'] as const) on(k, () => { throw new Error('store broken') })
-  else mock.store(on, opts.store)
+  else if (opts.sets) {
+    // a store in memory that also records every write (mock.store hands nothing back)
+    const kept = new Map<string, unknown>(Object.entries(opts.store ?? {}))
+    const sets = opts.sets
+    on('store.get', (_, e) => ({ value: kept.get((e as { key: string }).key) }) as never)
+    on('store.set', (_, e) => { const { key, value } = e as { key: string; value: unknown }; kept.set(key, value); sets.push({ key, value }); return { value: undefined } as never })
+    on('store.delete', (_, e) => { kept.delete((e as { key: string }).key); return { value: undefined } as never })
+    on('store.keys', () => ({ value: [...kept.keys()] }) as never)
+  } else mock.store(on, opts.store)
   const toasts: string[] = []
   let usage: Usage = { read: 0, write: 0 }
   const steps = { n: 0 } // main-model requests the engine saw
@@ -540,6 +548,7 @@ test('stats: a handoff on an expired chat counts the notice\'s saving and Haiku\
   await handoff($)
   const t = await stats($)
   expect(t).toContain('| Handoffs | 1 | 1 |')
+  expect(t).toContain('| Auto-compacts | 0 | 0 |')
   // Haiku in the stand-in used 40,000 in / 1,500 out, and the fresh chat's start is 13K:
   // 228K - 41.5K - 13K = 173.5K; $1.824 - $0.00475 - $0.104 = $1.715
   expect(t).toContain('| Tokens saved | 174K | 174K |')
@@ -801,4 +810,135 @@ test('update: when Claude Code says it is already at the latest, the reply never
   const t = await runUpdate($)
   expect(t.includes('Updated')).toBe(false)
   expect(t).toContain('claude plugin marketplace update cache-maxxing')
+})
+
+// --- auto-compact (0.6.0) ----------------------------------------------------------
+// The chat, Haiku and the engine's compaction are stand-ins; the ticker and the gate are real.
+function autoEngine(on: On, opts: { judgment?: string | null; compactRejects?: number; veto?: boolean; store?: Record<string, unknown>; sets?: { key: string; value: unknown }[] } = {}) {
+  const w = engine(on, { store: opts.store, sets: opts.sets })
+  const calls = { judgments: [] as { model: string; system?: unknown; prompt: unknown; effort?: string; maxTokens?: number }[], compacts: [] as { instructions?: string }[], notices: [] as string[] }
+  on('session.messages', () => ({ value: [
+    { role: 'user', text: 'make the tests pass', toolUses: [] },
+    { role: 'assistant', text: 'two still fail; next I will fix the parser', toolUses: [] },
+  ] }))
+  on('ui.log', () => ({ value: undefined }))
+  on('model.complete', (_, e) => {
+    calls.judgments.push(e as never)
+    return { value: opts.judgment === null
+      ? { isAnswered: false, reason: 'api-error', text: '' }
+      : { isAnswered: true, text: opts.judgment ?? 'UNFINISHED', usage: { input_tokens: 900, output_tokens: 3, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } } as never
+  })
+  on('session.compact', (_, e) => {
+    calls.compacts.push(e as never)
+    if (calls.compacts.length <= (opts.compactRejects ?? 0)) throw new Error('a turn is running')
+    return (opts.veto ? { skip: 'a hook said no' } : { messages: [{ role: 'user', text: 'summary of the chat', toolUses: [] }], tokensBefore: 300_000, tokensAfter: 31_000 }) as never
+  })
+  on('session.append', (_, e, next) => {
+    const m = (e as unknown as { message: { type: string; content: { text: string }[] } }).message
+    if (m.type === 'system') calls.notices.push(m.content[0]!.text)
+    return next(e)
+  })
+  return { ...w, calls }
+}
+
+test('auto-compact: an unfinished chat is compacted once, 5 minutes before its cache expires', async ($, on) => {
+  const a = autoEngine(on)
+  await start($)
+  await a.reply($, { read: 300_000, write: 0 })
+  await a.clock.advance(54 * MIN)
+  expect(a.calls.judgments.length).toBe(0) // 6 minutes left: not yet
+  await a.clock.advance(MIN + 2_000)
+  expect(a.steps.n).toBe(1) // the plugin itself never sends the chat to the main model
+  expect(a.calls.judgments.length).toBe(1)
+  expect(a.calls.judgments[0]).toMatchObject({ model: 'haiku', effort: 'low', maxTokens: 200 })
+  expect(String(a.calls.judgments[0]!.prompt)).toContain('two still fail')
+  expect(a.calls.compacts.length).toBe(1)
+  expect(String(a.calls.compacts[0]!.instructions)).toContain('exact next steps')
+  expect(a.calls.notices).toEqual([autoCompactNotice('cache', 300_000, 31_000)])
+  expect(a.toasts.some(t => t.includes('compacted this chat on its own'))).toBe(true)
+  await expectBar($, '🟠 cache reset (chat compacted) · next message ≈ $0.25 (40× more) · 31K / 1M · Small chat, fine to keep going')
+  await a.clock.advance(2 * MIN)
+  expect(a.calls.judgments.length).toBe(1)
+  expect(a.calls.compacts.length).toBe(1)
+  expect(String((await $.command.run({ command: 'cmaxx-stats', args: '' } as never)).text)).toContain('| Auto-compacts | 1 | 1 |')
+})
+
+test('auto-compact: a finished chat is left alone, and judged only once', async ($, on) => {
+  const a = autoEngine(on, { judgment: 'FINISHED' })
+  await start($)
+  await a.reply($, { read: 300_000, write: 0 })
+  await a.clock.advance(58 * MIN)
+  expect(a.calls.judgments.length).toBe(1)
+  expect(a.calls.compacts.length).toBe(0)
+  expect(a.calls.notices).toEqual([])
+})
+
+for (const [name, judgment] of [['Haiku is down', null], ['Haiku answers in prose', 'hard to say']] as const) {
+  test(`auto-compact: no usable judgment (${name}) means no compaction and no second question`, async ($, on) => {
+    const a = autoEngine(on, { judgment })
+    await start($)
+    await a.reply($, { read: 300_000, write: 0 })
+    await a.clock.advance(58 * MIN)
+    expect(a.calls.judgments.length).toBe(1)
+    expect(a.calls.compacts.length).toBe(0)
+  })
+}
+
+test('auto-compact: a refused compaction (a turn is running) is retried without asking Haiku again', async ($, on) => {
+  const a = autoEngine(on, { compactRejects: 1 })
+  await start($)
+  await a.reply($, { read: 300_000, write: 0 })
+  await a.clock.advance(55 * MIN + 2_000)
+  expect(a.calls.compacts.length).toBe(1)
+  expect(a.calls.notices).toEqual([])
+  await a.clock.advance(10_000)
+  expect(a.calls.compacts.length).toBe(2)
+  expect(a.calls.judgments.length).toBe(1)
+  expect(a.calls.notices.length).toBe(1)
+})
+
+test('auto-compact: a vetoed compaction is not tried again', async ($, on) => {
+  const a = autoEngine(on, { veto: true })
+  await start($)
+  await a.reply($, { read: 300_000, write: 0 })
+  await a.clock.advance(58 * MIN)
+  expect(a.calls.compacts.length).toBe(1)
+  expect(a.calls.notices).toEqual([])
+})
+
+test('auto-compact: a small chat is never judged (its rebuild is cheap anyway)', async ($, on) => {
+  const a = autoEngine(on)
+  await start($)
+  await a.reply($, { read: 30_000, write: 0 })
+  await a.clock.advance(70 * MIN)
+  expect(a.calls.judgments.length).toBe(0)
+})
+
+test("auto-compact: another chat's limit reading (94% of the 5-hour window) compacts this idle chat early", async ($, on) => {
+  const a = autoEngine(on, { store: { rl: { at: T0, limits: [{ kind: 'five_hour', percentUsed: 94 }] } } })
+  await start($)
+  await a.reply($, { read: 300_000, write: 0 })
+  await a.clock.advance(40_000)
+  expect(a.calls.compacts.length).toBe(1)
+  expect(a.calls.notices).toEqual([autoCompactNotice('limit', 300_000, 31_000)])
+})
+
+test('auto-compact: a reply\'s rate-limit reading is shared with the other chats', async ($, on) => {
+  const sets: { key: string; value: unknown }[] = []
+  const a = autoEngine(on, { sets })
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  await start($)
+  await $.session.measure({ context: { window: 1_000_000 }, rateLimits: [{ kind: 'seven_day', percentUsed: 95, resetsAt: '2030-01-01T00:00:00Z' }], changed: ['rateLimits'] } as never)
+  expect(sets.find(x => x.key === 'rl')?.value).toEqual({ at: T0, limits: [{ kind: 'seven_day', percentUsed: 95, resetsAt: '2030-01-01T00:00:00Z' }] })
+  await a.reply($, { read: 300_000, write: 0 })
+  await a.clock.advance(40_000)
+  expect(a.calls.compacts.length).toBe(1)
+})
+
+test('auto-compact: claude -p and other non-interactive sessions are never compacted', async ($, on) => {
+  const a = autoEngine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: false })
+  await a.reply($, { read: 300_000, write: 0 })
+  await a.clock.advance(58 * MIN)
+  expect(a.calls.judgments.length).toBe(0)
 })
