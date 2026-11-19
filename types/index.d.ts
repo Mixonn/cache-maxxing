@@ -20,6 +20,6 @@ export type Rec = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'cache-maxxing': { last: Shaped<Rec | null>; tick: number; hidden: boolean }
+    'cache-maxxing': { last: Shaped<Rec | null>; tick: number; hidden: boolean; writing: boolean }
   }
 }

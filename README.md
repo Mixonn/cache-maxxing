@@ -6,7 +6,7 @@
 
 **See when Claude's prompt cache expires, and what your next message will cost, before you send it.**
 
-[![version](https://img.shields.io/badge/version-0.6.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.7.0-blue)](CHANGELOG.md)
 [![license: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-orange)](https://code.claude.com/docs/en/discover-plugins)
 
@@ -44,7 +44,7 @@ Claude keeps your chat "warm" only for a while so follow-up messages barely dent
 | 🚦 **One clear tip** | 🟢 keep going · 🟡 reply soon · 🟠 expired small chat, fine · 🔴 expired, with what a handoff would save. |
 | 🔔 **One pop-up** | A single warning when a big chat's cache expires, and a heads-up if you send into it. Your message is never stopped. |
 | 🗜️ **Auto-compact** | Walk away mid-task: 5 minutes before the cache expires, Haiku judges whether the work is finished, and an unfinished chat is compacted in place. A finished chat is left alone. |
-| 🔄 **`/cmaxx-handoff`** | Haiku (effort: High) writes a briefing of the chat; a fresh chat picks up from it. The expired chat is never resent to the main model. |
+| 🔄 **`/cmaxx-handoff`** | Haiku (effort: High) writes a briefing of the chat; a fresh chat picks up from it. The expired chat is never resent to the main model. On the 🔴 bar it is also a **🔄 Handoff** button. |
 | 📊 **`/cmaxx-stats`** | Money and tokens saved, cache hit rate, rebuilds paid: for this chat and for all chats. |
 | ⬆️ **`/cmaxx-update`** | Updates the plugin, or at least its model and price list, so new models are priced on day one. |
 | 🔒 **Local by default** | No network. Model calls only from the two commands above, when you run them, and from auto-compact, which you can turn off. |
@@ -78,6 +78,14 @@ Answer `y` to add the marketplace and press Enter for the user scope. The bar sh
 |---|---|
 | `/cmaxx` | Hide or show the bar in this chat (the **✕** on the bar hides it too). |
 | `/cmaxx-handoff` | Write a briefing of this chat with Haiku and start a fresh chat from it. (Doesn't trigger the old chat's model) |
+| **🔄 Handoff** button | The same, in one click, on the 🔴 bar: a big chat whose cache has expired. |
+
+**The handoff button.** You forgot about a big chat and its cache expired: sending a message now would re-read all of it at full price. Click **🔄 Handoff** on the 🔴 bar instead. Haiku reads the chat from your disk (never the expired cache) and writes a briefing: the goal, decisions, what failed, the next steps. Then:
+
+- **Desktop app:** the line `Read .claude/handoffs/….md and continue from where we left off.` is on your clipboard. Start a new chat (⌘N), paste, send. The old chat stays where it was.
+- **Terminal and VS Code:** the chat clears to a fresh one with that line already in the box; send it.
+
+While the briefing is written (up to a minute), the button reads **⏳ Writing…**. It costs about a cent of Haiku. The button shows only on 🔴: on 🟠 the chat is small and simply carrying on is cheap.
 | `/cmaxx-stats` | Show savings, cache hit rate, rebuilds and replies: this chat and all chats. |
 | `/cmaxx-update` | Update to the latest version, or refresh the model and price list. |
 
@@ -146,7 +154,7 @@ What it costs: Haiku's judgment is a fraction of a cent. The compaction is done 
 |---|---|
 | You leave a big chat mid-task | With 5 minutes left on the cache, Haiku judges it unfinished and the chat is compacted. You come back to a small chat with a notice in it. |
 | Claude asked you a question and you left | Same: waiting for your answer counts as unfinished. |
-| The work is done (request answered, pull request opened) | Judged once, left alone. The cache expires and the bar turns 🔴 as before; `/cmaxx-handoff` is there if you need the chat again. |
+| The work is done (request answered, pull request opened) | Judged once, left alone. The cache expires and the bar turns 🔴 with a **🔄 Handoff** button, if you need the chat again. |
 | The chat is small (rebuild under the rebuild limit) | Never judged, never compacted: rebuilding it is cheap anyway. |
 | You reply before the 5-minute mark | Nothing happens. The reply restarts the hour, and that reply gets its own judgment later. |
 | Your 5-hour or weekly limit reaches 93% | Every open, big, unfinished chat whose cache is still active is judged and compacted right away, however much cache time is left. An idle chat learns of the limit within 30 seconds of the chat that hit it. |

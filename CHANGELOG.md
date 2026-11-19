@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.7.0] - fork: handoff button
+
+### Added
+- A **🔄 Handoff** button on the 🔴 bar: one click does what `/cmaxx-handoff` does. In the desktop app the line for the new chat is put on the clipboard (start a new chat and paste); in the terminal and VS Code the chat clears to a fresh one with the line in its box. The button reads **⏳ Writing…** while Haiku writes the briefing.
+
+### Changed
+- `/cmaxx-handoff` and the button share one handoff, and only one runs at a time.
+
 ## [0.6.0] - fork: auto-compact
 
 ### Added

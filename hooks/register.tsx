@@ -26,6 +26,9 @@ const last = atom({ plugin: 'cache-maxxing', key: 'last' } as const, null, { sha
 const tick = atom({ plugin: 'cache-maxxing', key: 'tick' } as const, 0)
 // Closed with the bar's ✕ for this chat; /cmaxx brings it back.
 const hidden = atom({ plugin: 'cache-maxxing', key: 'hidden' } as const, false)
+// The 🔴 bar's handoff button while its handoff is being written (Haiku may take a minute).
+const writing = atom({ plugin: 'cache-maxxing', key: 'writing' } as const, false)
+let isHandoffBusy = false // one handoff at a time, from the command or the button
 
 // Module variables survive /clear ($.state does not): the handoff line waiting for the
 // fresh chat, and the transcript path from the latest SessionStart.
@@ -228,6 +231,88 @@ async function loadPrices($: EngineInterface) {
   const v = validatePrices(await $.store.get('prices'), PRICES_DATE)
   // only a table newer than the bundled one: a release's corrected prices always win
   setPriceOverride('error' in v || v.sourceDate <= PRICES_DATE ? null : v.prices)
+}
+
+// /cmaxx-handoff and the 🔴 bar's button: Haiku writes the brief from the chat read locally. Never
+// $.model.fork: it would resend this chat's prefix, the very rebuild a handoff exists to avoid.
+// Answers the command's output: the text to show, or nothing when a notice row holds it.
+async function runHandoff($: EngineInterface, settings: Settings): Promise<{ text?: string }> {
+  try {
+    $.ui.toast('cache-maxxing: writing the handoff…')
+    const skill = parseSkill(String(await $.fs.read(`${$.plugin.root}/hooks/handoff-skill.md`)))
+    const messages = await $.session.messages()
+    const sessionId = await $.session.id()
+    const now = await $.clock.now()
+    const rec = await read($, last)
+    const facts = extractFacts(messages)
+    const nums: Numbers = rec ? { tokens: rec.prefix, window: rec.window, model: rec.model, bar: decide(rec, now, settings).text } : {}
+    const r = await $.model.complete({
+      model: 'haiku',
+      system: skill.brief,
+      prompt: briefPrompt(messages, facts, nums, skill.closing),
+      effort: 'high',
+      // the API's ceiling, not a budget. shortcut: no output cap yet; set one from a few real briefs
+      maxTokens: 64_000,
+      timeoutMs: 180_000, // your call: a slow API gets 3 minutes, then the facts-only file
+    })
+    const usable = r.isAnswered && r.text.trim() && isValidBrief(r.text) ? r.text : undefined
+    // why a brief is facts only, with Haiku's token counts: out at the cap means it ran out of room
+    const problem = usable ? undefined : !r.isAnswered ? `Haiku ${r.reason}` : `Haiku's reply had ${r.text.trim() ? 'none of the sections' : 'no text'}, in ${r.usage.input_tokens} / out ${r.usage.output_tokens} of 64000 tokens`
+    const transcript = transcriptPath ?? transcriptGuess(await $.session.cwd(), sessionId, await $.env.get('CLAUDE_CONFIG_DIR').catch(() => undefined))
+    const path = handoffPath(now, sessionId)
+    await $.fs.write(path, assembleBrief({ sessionId, transcript, skill }, facts, nums, usable))
+    // briefs quote the chat: the folder ignores itself so `git add -A` never picks them up
+    const ignore = '.claude/handoffs/.gitignore'
+    if (!(await $.fs.stat(ignore).catch(() => undefined))) await $.fs.write(ignore, '*\n').catch(() => {})
+    const line = seedLine(path)
+    const c = rec && costs(rec)
+    const haiku = r.isAnswered ? { in: r.usage.input_tokens, out: r.usage.output_tokens, usd: haikuUsd(r.usage.input_tokens, r.usage.output_tokens) } : null
+    const main = rec && c ? { model: rec.model, tokens: rec.prefix, cold: c.cold, isCold: ['red', 'orange'].includes(decide(rec, now, settings).light) } : null
+    let text = savingsLine({ path, problem, haiku, main })
+    // counted as the notice says it: a saving only when the cache had expired
+    // once per expired cache: running it again, or carrying on in the old chat, saves nothing more (issue #3)
+    const saved = main?.isCold && rec!.at !== savedFor ? handoffSaving(main.tokens, main.cold, haiku) : null
+    if (saved) savedFor = rec!.at
+    await count($, { handoffs: 1, ...(saved ? { savedTokens: saved.tokens, savedUsd: saved.usd } : {}) }, sessionId).catch(() => {})
+    await flush($).catch(() => {}) // the old chat is about to be cleared: keep its handoff now
+    if ((await $.session.surfaces()).includes('desktop')) {
+      // desktop reuses the tab on /clear, so the old chat drops out of view, and its own
+      // composer refuses a fill (live 00:12, F52): there the old chat stays put
+      const c = await $.ui.copy({ text: line }).catch(() => ({ isCopied: false }))
+      text += ` To continue, start a new chat and paste${c.isCopied ? ' (auto-copied)' : ''}: ${line}`
+      $.ui.toast(text)
+      // the desktop app doesn't draw a system notice row (live 00:31, F53): use the command's output
+      return { text }
+    } else {
+      pendingSeed = { line, at: await $.clock.now() } // after Haiku: the call itself may take minutes
+      // /clear is refused from inside this hook (measured), so it starts on a timer just
+      // after the command returns; the clear SessionStart above puts the line in the new chat's box
+      $.clock.after(0, () => void clearThenSeed($, line))
+    }
+    // a notice row kept in this chat's transcript (the model never reads it), so the line is
+    // there whenever the user comes back; command output went unseen after the clear (00:01)
+    const kept = await $.session.append({ message: { type: 'system', content: [{ type: 'text', text }] } }).catch(() => ({ deny: 'error' }))
+    return kept.deny ? { text } : {}
+  } catch (err) {
+    return { text: `cache-maxxing: no handoff written (${String(err)}). This chat is untouched.` }
+  }
+}
+
+// The button: the same handoff as the command. Its result shows as a pop-up, since a button has
+// no command output; on desktop that pop-up says the line is on the clipboard.
+async function pressHandoff($: EngineInterface, settings: Settings) {
+  if (isHandoffBusy) return
+  isHandoffBusy = true
+  await update($, writing, () => true)
+  try {
+    const r = await runHandoff($, settings)
+    if (r.text && !r.text.startsWith('Handoff saved to')) $.ui.toast(r.text) // an error; a saved one already popped up
+  } catch (err) {
+    $.ui.toast(`cache-maxxing: no handoff written (${String(err)}). This chat is untouched.`)
+  } finally {
+    isHandoffBusy = false
+    await update($, writing, () => false).catch(() => {})
+  }
 }
 
 export const register: Register = (on, options) => {
@@ -497,67 +582,13 @@ export const register: Register = (on, options) => {
     return { text: statsText(chat, all, settings) }
   })
 
-  // /cmaxx-handoff: Haiku writes the brief from the chat read locally. Never $.model.fork:
-  // it would resend this chat's prefix, the very rebuild a handoff exists to avoid.
   on('command.run', { command: 'cmaxx-handoff' }, async $ => {
+    if (isHandoffBusy) return { text: 'cache-maxxing: a handoff is already being written.' }
+    isHandoffBusy = true
     try {
-      $.ui.toast('cache-maxxing: writing the handoff…')
-      const skill = parseSkill(String(await $.fs.read(`${$.plugin.root}/hooks/handoff-skill.md`)))
-      const messages = await $.session.messages()
-      const sessionId = await $.session.id()
-      const now = await $.clock.now()
-      const rec = await read($, last)
-      const facts = extractFacts(messages)
-      const nums: Numbers = rec ? { tokens: rec.prefix, window: rec.window, model: rec.model, bar: decide(rec, now, settings).text } : {}
-      const r = await $.model.complete({
-        model: 'haiku',
-        system: skill.brief,
-        prompt: briefPrompt(messages, facts, nums, skill.closing),
-        effort: 'high',
-        // the API's ceiling, not a budget. shortcut: no output cap yet; set one from a few real briefs
-        maxTokens: 64_000,
-        timeoutMs: 180_000, // your call: a slow API gets 3 minutes, then the facts-only file
-      })
-      const usable = r.isAnswered && r.text.trim() && isValidBrief(r.text) ? r.text : undefined
-      // why a brief is facts only, with Haiku's token counts: out at the cap means it ran out of room
-      const problem = usable ? undefined : !r.isAnswered ? `Haiku ${r.reason}` : `Haiku's reply had ${r.text.trim() ? 'none of the sections' : 'no text'}, in ${r.usage.input_tokens} / out ${r.usage.output_tokens} of 64000 tokens`
-      const transcript = transcriptPath ?? transcriptGuess(await $.session.cwd(), sessionId, await $.env.get('CLAUDE_CONFIG_DIR').catch(() => undefined))
-      const path = handoffPath(now, sessionId)
-      await $.fs.write(path, assembleBrief({ sessionId, transcript, skill }, facts, nums, usable))
-      // briefs quote the chat: the folder ignores itself so `git add -A` never picks them up
-      const ignore = '.claude/handoffs/.gitignore'
-      if (!(await $.fs.stat(ignore).catch(() => undefined))) await $.fs.write(ignore, '*\n').catch(() => {})
-      const line = seedLine(path)
-      const c = rec && costs(rec)
-      const haiku = r.isAnswered ? { in: r.usage.input_tokens, out: r.usage.output_tokens, usd: haikuUsd(r.usage.input_tokens, r.usage.output_tokens) } : null
-      const main = rec && c ? { model: rec.model, tokens: rec.prefix, cold: c.cold, isCold: ['red', 'orange'].includes(decide(rec, now, settings).light) } : null
-      let text = savingsLine({ path, problem, haiku, main })
-      // counted as the notice says it: a saving only when the cache had expired
-      // once per expired cache: running it again, or carrying on in the old chat, saves nothing more (issue #3)
-      const saved = main?.isCold && rec!.at !== savedFor ? handoffSaving(main.tokens, main.cold, haiku) : null
-      if (saved) savedFor = rec!.at
-      await count($, { handoffs: 1, ...(saved ? { savedTokens: saved.tokens, savedUsd: saved.usd } : {}) }, sessionId).catch(() => {})
-      await flush($).catch(() => {}) // the old chat is about to be cleared: keep its handoff now
-      if ((await $.session.surfaces()).includes('desktop')) {
-        // desktop reuses the tab on /clear, so the old chat drops out of view, and its own
-        // composer refuses a fill (live 00:12, F52): there the old chat stays put
-        const c = await $.ui.copy({ text: line }).catch(() => ({ isCopied: false }))
-        text += ` To continue, start a new chat and paste${c.isCopied ? ' (auto-copied)' : ''}: ${line}`
-        $.ui.toast(text)
-        // the desktop app doesn't draw a system notice row (live 00:31, F53): use the command's output
-        return { text }
-      } else {
-        pendingSeed = { line, at: await $.clock.now() } // after Haiku: the call itself may take minutes
-        // /clear is refused from inside this hook (measured), so it starts on a timer just
-        // after the command returns; the clear SessionStart above puts the line in the new chat's box
-        $.clock.after(0, () => void clearThenSeed($, line))
-      }
-      // a notice row kept in this chat's transcript (the model never reads it), so the line is
-      // there whenever the user comes back; command output went unseen after the clear (00:01)
-      const kept = await $.session.append({ message: { type: 'system', content: [{ type: 'text', text }] } }).catch(() => ({ deny: 'error' }))
-      return kept.deny ? { text } : {}
-    } catch (err) {
-      return { text: `cache-maxxing: no handoff written (${String(err)}). This chat is untouched.` }
+      return await runHandoff($, settings)
+    } finally {
+      isHandoffBusy = false
     }
   })
 
@@ -565,7 +596,9 @@ export const register: Register = (on, options) => {
     if (await read($, hidden)) return next(e)
     const rec = await read($, last)
     await read($, tick) // subscribe so the bar redraws every second
-    const text = rec ? decide(rec, await $.clock.now(), settings).text : WAITING
+    const verdict = rec ? decide(rec, await $.clock.now(), settings) : null
+    const text = verdict?.text ?? WAITING
+    const isWriting = await read($, writing)
     const { Box, Button, Text } = $.ui.resolve(e)
     // text wraps on the left; ✕ stays pinned top-right however many lines it takes.
     // nowrap + minWidth 0: VS Code's webview otherwise wraps the ✕ onto its own line (P2)
@@ -574,6 +607,9 @@ export const register: Register = (on, options) => {
         <Box key="text" flexGrow={1} flexShrink={1} minWidth={0}>
           <Text>{text}</Text>
         </Box>
+        {verdict?.light === 'red' || isWriting ? (
+          <Button key="handoff" label={isWriting ? '⏳ Writing…' : '🔄 Handoff'} onPress={() => (isWriting ? undefined : pressHandoff($, settings))} />
+        ) : null}
         <Button key="close" label="✕" plain dimColor onPress={() => update($, hidden, () => true)} />
       </Box>
     )

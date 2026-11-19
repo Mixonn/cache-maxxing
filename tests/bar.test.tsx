@@ -942,3 +942,76 @@ test('auto-compact: claude -p and other non-interactive sessions are never compa
   await a.clock.advance(58 * MIN)
   expect(a.calls.judgments.length).toBe(0)
 })
+
+// --- the handoff button (0.7.0) ----------------------------------------------------
+// One click on the 🔴 bar does what /cmaxx-handoff does. On desktop the fresh chat is the user's
+// Cmd+N and paste: the line is on the clipboard and the old chat stays put.
+async function pressHandoff($: Dollar, surface: (typeof SURFACES)[number]) {
+  const ui = await $.ui.mount({ ...BAR, surface })
+  await ui.press({ key: 'handoff' })
+  await ui.unmount()
+}
+
+test('handoff button: only on the 🔴 bar, on every surface', async ($, on) => {
+  const h = handoffEngine(on)
+  await start($)
+  await h.reply($, { read: 228_000, write: 0 })
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...BAR, surface })
+    expect(await ui.find({ type: 'Button', key: 'handoff' })).toBe(undefined) // 🟢: nothing to save yet
+    await ui.unmount()
+  }
+  await h.clock.advance(70 * MIN)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...BAR, surface })
+    expect((await ui.find({ type: 'Button', key: 'handoff' }))?.text).toBe('🔄 Handoff')
+    await ui.unmount()
+  }
+})
+
+test('handoff button: not on a small expired chat (🟠), where a rebuild is cheap', async ($, on) => {
+  const h = handoffEngine(on)
+  await start($)
+  await h.reply($, { read: 30_000, write: 0 })
+  await h.clock.advance(70 * MIN)
+  const ui = await $.ui.mount({ ...BAR, surface: 'desktop' })
+  expect(await ui.find({ type: 'Button', key: 'handoff' })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('handoff button on desktop: Haiku writes the brief, the line is copied, the old chat stays, the main model never runs', async ($, on) => {
+  const h = handoffEngine(on, { surface: 'desktop' })
+  await start($)
+  await h.reply($, { read: 228_000, write: 0 })
+  await h.clock.advance(70 * MIN)
+  await pressHandoff($, 'desktop')
+  expect(h.steps.n).toBe(1) // only the reply above: the expired chat was never resent
+  expect(h.calls.model.filter(c => c.effort === 'high').length).toBe(1) // the handoff; auto-compact's own judgment ran too, at 5 minutes left
+  expect(h.calls.writes[0]!.path).toMatch(/\/\.claude\/handoffs\/.+-chat-1\.md$/)
+  expect(h.calls.copies.length).toBe(1)
+  expect(h.calls.copies[0]).toMatch(/^Read \.claude\/handoffs\/.+-chat-1\.md and continue from where we left off\.$/)
+  expect(h.calls.clears).toBe(0)
+  expect(h.toasts.some(t => t.includes('start a new chat and paste (auto-copied)'))).toBe(true)
+  expect(await stats($)).toContain('| Handoffs | 1 | 1 |')
+})
+
+test('handoff button in the terminal: clears to a fresh chat with the line in its box, as the command does', async ($, on) => {
+  const h = handoffEngine(on, { surface: 'terminal' })
+  await start($, 'terminal')
+  await h.reply($, { read: 228_000, write: 0 })
+  await h.clock.advance(70 * MIN)
+  await pressHandoff($, 'terminal')
+  await h.clock.advance(1)
+  expect(h.calls.model.filter(c => c.effort === 'high').length).toBe(1) // the handoff; auto-compact's own judgment ran too, at 5 minutes left
+  expect(h.calls.clears).toBe(1)
+})
+
+test('handoff button: Haiku unavailable still writes the facts-only brief and copies the line', async ($, on) => {
+  const h = handoffEngine(on, { surface: 'desktop', reply: null })
+  await start($)
+  await h.reply($, { read: 228_000, write: 0 })
+  await h.clock.advance(70 * MIN)
+  await pressHandoff($, 'desktop')
+  expect(h.calls.writes.length >= 1).toBe(true)
+  expect(h.calls.copies.length).toBe(1)
+})
