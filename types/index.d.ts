@@ -16,10 +16,23 @@ export type Rec = {
   // auto-compact's verdict on this reply: judged = finished, or Haiku gave no usable answer (never asked
   // again); due = unfinished, compaction still pending; compacted = done. A new reply starts without one.
   auto?: 'judged' | 'due' | 'compacted'
+  // Haiku's word on whether this reply's work is finished, shared by auto-compact and keepwarm so
+  // it is asked at most once per reply: null = asked, no usable answer. A new reply starts without one.
+  finished?: boolean | null
+}
+
+// A keepwarm window in this chat (0.8.0): started from the bar or /cmaxx-warm, in memory only,
+// so an app restart or /clear ends it.
+export type Warm = {
+  until: number // ms epoch when the window ends
+  hours: number // the window as asked, for the stop notice
+  pings: number
+  usd: number // what this window's pings cost at list prices
+  lastPingUsd?: number
 }
 
 declare module 'claude-code' {
   interface PluginState {
-    'cache-maxxing': { last: Shaped<Rec | null>; tick: number; hidden: boolean; writing: boolean }
+    'cache-maxxing': { last: Shaped<Rec | null>; tick: number; hidden: boolean; writing: boolean; warm: Warm | null }
   }
 }

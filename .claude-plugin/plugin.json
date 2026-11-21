@@ -1,7 +1,7 @@
 {
   "name": "cache-maxxing",
-  "version": "0.7.2",
-  "description": "Shows how long Claude's chat memory (prompt cache) stays active and what your next message costs, and compacts big unfinished chats on its own before that memory expires",
+  "version": "0.8.0",
+  "description": "Shows how long Claude's chat memory (prompt cache) stays active and what your next message costs, asks before an expensive message, keeps the cache warm while you are away when you ask, and compacts big unfinished chats on its own before that memory expires",
   "types": "./types/index.d.ts",
   "userConfig": {
     "rebuildLimitUsd": {
@@ -63,6 +63,28 @@
       "type": "number",
       "title": "Auto-compact: usage limit (%)",
       "description": "At this much of your 5-hour or weekly usage limit, unfinished chats are compacted at once, while their memory is still active.",
+      "default": 93
+    },
+    "sendGuard": {
+      "type": "string",
+      "title": "Before an expensive message",
+      "description": "ask: when the bar is red, Claude Code asks Send anyway or Don't send before your message goes out. warn: a pop-up only, the message always goes out.",
+      "options": [
+        "ask",
+        "warn"
+      ],
+      "default": "ask"
+    },
+    "keepWarmHours": {
+      "type": "number",
+      "title": "Keepwarm: default hours",
+      "description": "The window the bar's Keepwarm button offers first, and /cmaxx-warm uses with no argument (up to 48).",
+      "default": 8
+    },
+    "keepWarmLimitPercent": {
+      "type": "number",
+      "title": "Keepwarm: usage limit (%)",
+      "description": "Keepwarm stops at this much of your 5-hour or weekly usage limit, so pings never eat the last of it.",
       "default": 93
     }
   },

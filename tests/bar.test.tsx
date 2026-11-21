@@ -3,7 +3,7 @@
 // the SAME text, so a change made for VS Code or the terminal can't silently break desktop.
 import { expect, mock, test } from 'claude-code/testing'
 
-import { PRICES_DATE, autoCompactNotice } from '../hooks/logic'
+import { GUARD_CLOSED, GUARD_NOT_SENT, PRICES_DATE, autoCompactNotice } from '../hooks/logic'
 
 const SURFACES = ['desktop', 'vscode', 'terminal'] as const
 const MIN = 60_000
@@ -450,8 +450,8 @@ test('handoff in the terminal: clears to a fresh chat, line in its box, notice k
   expect(h.calls.fills[0]).toMatch(/^Read \.claude\/handoffs\/.+-chat-1\.md and continue from where we left off\.$/)
 })
 
-// Sending into an expired big chat warns once and never blocks (RULES); checked on the terminal.
-test('send warning in the terminal: a red chat warns, the message still goes through unchanged', async ($, on) => {
+// With sendGuard warn, sending into an expired big chat warns once and never blocks; checked on the terminal.
+test('send warning in the terminal (sendGuard warn): a red chat warns, the message still goes through unchanged', { options: { sendGuard: 'warn' } }, async ($, on) => {
   const w = engine(on)
   on('prompt.submit', (_, e) => ({ text: (e as { text: string }).text }) as never)
   await start($, 'terminal')
@@ -469,7 +469,7 @@ test('send warning in the terminal: a red chat warns, the message still goes thr
 test('a broken store never costs the commands, the bar or the pop-up', async ($, on) => {
   const w = engine(on, { brokenStore: true })
   await start($)
-  expect(w.commands).toEqual(['cmaxx', 'cmaxx-handoff', 'cmaxx-update', 'cmaxx-stats'])
+  expect(w.commands).toEqual(['cmaxx', 'cmaxx-handoff', 'cmaxx-update', 'cmaxx-stats', 'cmaxx-warm'])
   await w.reply($, { read: 290_000, write: 0 })
   await w.clock.advance(MIN)
   await expectBar($, '🟢 59 min left · next message ≈ $0.06 · 290K / 1M · ✅ Keep going')
@@ -1046,4 +1046,230 @@ test('handoff button: Haiku unavailable still writes the facts-only brief and co
   await pressHandoff($, 'desktop')
   expect(h.calls.writes.length >= 1).toBe(true)
   expect(h.calls.copies.length).toBe(1)
+})
+
+// --- the cold-send guard (0.8.0) ----------------------------------------------------------
+// Claude Code's dialog beneath the plugin: answers with a label, or null to close it, and records each question.
+function answering(on: On, answer: string | null | (() => string | null)) {
+  const asked: { question: string; options: string[] }[] = []
+  on('tool.call', { tool: 'AskUserQuestion' }, (_, e) => {
+    const q = (e as unknown as { questions: { question: string; options: { label: string }[] }[] }).questions[0]!
+    asked.push({ question: q.question, options: q.options.map(o => o.label) })
+    const a = typeof answer === 'function' ? answer() : answer
+    if (a === null) return { deny: 'dismissed' } as never
+    return { result: { questions: (e as unknown as { questions: unknown[] }).questions, answers: { [q.question]: a } } } as never
+  })
+  return asked
+}
+
+async function redChat($: Dollar, on: On) {
+  on('prompt.submit', (_, e) => ({ text: (e as { text: string }).text }) as never)
+  await start($, 'terminal')
+  await $.classic.SessionStart({ source: 'resume', session_id: 'chat-1', seconds_since_last_response: 7200, context_tokens: 290_000, prompt_cache_likely_expired: true, model: 'claude-opus-5-5' } as never)
+}
+const send = ($: Dollar, text = 'carry on', kind = 'composer') => $.prompt.submit({ text, wait: false, origin: { kind } } as never) as Promise<{ text?: string; drop?: string }>
+
+test('guard: a 🔴 chat asks first; Send anyway sends the message unchanged', async ($, on) => {
+  engine(on)
+  const asked = answering(on, 'Send anyway ($2.32)')
+  await redChat($, on)
+  const r = await send($)
+  expect(r.drop).toBe(undefined)
+  expect(r.text).toBe('carry on')
+  expect(asked.length).toBe(1)
+  expect(asked[0]!.options).toEqual(['Send anyway ($2.32)', "Don't send"])
+  expect(asked[0]!.question).toMatch(/^cache-maxxing: this chat's cache expired 1h 00m ago, so this message rewrites 290K tokens ≈ \$2\.32/)
+})
+
+test("guard: Don't send drops the message, and the next send is asked again", async ($, on) => {
+  engine(on)
+  const asked = answering(on, "Don't send")
+  await redChat($, on)
+  expect((await send($)).drop).toBe(GUARD_NOT_SENT)
+  expect((await send($)).drop).toBe(GUARD_NOT_SENT)
+  expect(asked.length).toBe(2)
+})
+
+test('guard: a closed question drops once; the resend goes through unasked', async ($, on) => {
+  engine(on)
+  const asked = answering(on, null)
+  await redChat($, on)
+  expect((await send($)).drop).toBe(GUARD_CLOSED)
+  const r = await send($)
+  expect(r.drop).toBe(undefined)
+  expect(r.text).toBe('carry on')
+  expect(asked.length).toBe(1)
+})
+
+test('guard: never asks a warm chat, a slash command or a prompt nobody typed', async ($, on) => {
+  const w = engine(on)
+  const asked = answering(on, "Don't send")
+  on('prompt.submit', (_, e) => ({ text: (e as { text: string }).text }) as never)
+  await start($)
+  await w.reply($, { read: 290_000, write: 0 })
+  await w.clock.advance(30 * MIN)
+  expect((await send($)).drop).toBe(undefined)
+  await w.clock.advance(60 * MIN)
+  expect((await send($, 'x', 'sdk')).drop).toBe(undefined)
+  expect((await $.prompt.submit({ text: '/cmaxx', command: 'cmaxx', wait: false, origin: { kind: 'composer' } } as never) as { drop?: string }).drop).toBe(undefined)
+  expect(asked.length).toBe(0)
+})
+
+// --- keepwarm (0.8.0) ------------------------------------------------------------------------
+// The fork beneath the plugin: each ping reads the chat's cache unless told otherwise.
+type ForkReply = { read?: number; write?: number; busy?: number } | 'nothing'
+function warmEngine(on: On, opts: { judgment?: string | null; forks?: ForkReply[]; store?: Record<string, unknown>; answer?: string | null } = {}) {
+  const a = autoEngine(on, { judgment: opts.judgment, store: opts.store })
+  const forks: { prompt?: string }[] = []
+  on('model.fork', (_, e) => {
+    forks.push(e as never)
+    const f = opts.forks?.[forks.length - 1] ?? {}
+    if (f === 'nothing') return { value: { isAnswered: false, reason: 'nothing-to-fork' } } as never
+    if (f.busy) return { value: { isAnswered: false, reason: 'api-error', status: f.busy } } as never
+    return { value: { isAnswered: true, text: 'warm', usage: { input_tokens: 20, output_tokens: 5, cache_read_input_tokens: f.read ?? 300_000, cache_creation_input_tokens: f.write ?? 500 } } } as never
+  })
+  const asked = answering(on, opts.answer === undefined ? '8h' : opts.answer)
+  return { ...a, forks, asked }
+}
+const warmCmd = async ($: Dollar, args = '') => String((await $.command.run({ command: 'cmaxx-warm', args } as never)).text)
+
+test('keepwarm: /cmaxx-warm pings 10 minutes before expiry, Haiku judges first, the hour restarts', async ($, on) => {
+  const k = warmEngine(on)
+  await start($)
+  await k.reply($, { read: 300_000, write: 0 })
+  expect(await warmCmd($)).toBe('cache-maxxing: keepwarm on for 8h 00m. A ping 10 min before the cache expires keeps it warm, each ≈ $0.06. It stops early when the work looks finished or your usage limit reaches 93%.')
+  await k.clock.advance(49 * MIN)
+  expect(k.forks.length).toBe(0)
+  expect(k.calls.judgments.length).toBe(0)
+  await k.clock.advance(MIN + 2_000)
+  expect(k.calls.judgments.length).toBe(1)
+  expect(k.forks.length).toBe(1)
+  expect(k.forks[0]!.prompt).toBe('Reply with the single word: warm')
+  expect(k.steps.n).toBe(1) // a fork, never a main-model request
+  await expectBar($, '🟢 60 min left · next message ≈ $0.06 · 300K / 1M · 🔄 Try /cmaxx-handoff or a new chat · 🔥 keepwarm 7h 09m left · 1 ping $0.06')
+  expect(await stats($)).toContain('| Keepwarm pings | 1 ($0.06) | 1 ($0.06) |')
+})
+
+test('keepwarm: holds the cache for hours, judging once per reply; auto-compact stays out of its way', async ($, on) => {
+  const k = warmEngine(on)
+  await start($)
+  await k.reply($, { read: 300_000, write: 0 })
+  await warmCmd($)
+  for (let i = 0; i < 18; i++) await k.clock.advance(10 * MIN)
+  expect(k.forks.length).toBe(3) // minutes 50, 100, 150
+  expect(k.calls.judgments.length).toBe(1)
+  expect(k.calls.compacts.length).toBe(0)
+  expect((await bars($))[0]).toMatch(/^🟢 [23][0-9] min left .* · 🔥 keepwarm 5h 00m left · 3 pings \$0\.19$/)
+})
+
+test('keepwarm: stops when Haiku judges the work finished, before any ping', async ($, on) => {
+  const k = warmEngine(on, { judgment: 'FINISHED' })
+  await start($)
+  await k.reply($, { read: 300_000, write: 0 })
+  await warmCmd($)
+  await k.clock.advance(52 * MIN)
+  expect(k.forks.length).toBe(0)
+  expect(k.toasts.some(t => t.includes('keepwarm stopped, the work looks finished (no pings)'))).toBe(true)
+  expect(k.calls.compacts.length).toBe(0)
+  expect((await bars($))[0]!.includes('🔥')).toBe(false)
+})
+
+test('keepwarm: stops at the usage limit, and auto-compact then compacts the unfinished chat', async ($, on) => {
+  const k = warmEngine(on)
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  await start($)
+  await k.reply($, { read: 300_000, write: 0 })
+  await warmCmd($)
+  await k.clock.advance(51 * MIN)
+  expect(k.forks.length).toBe(1)
+  await $.session.measure({ context: { window: 1_000_000 }, rateLimits: [{ kind: 'seven_day', percentUsed: 95 }], changed: ['rateLimits'] } as never)
+  await k.clock.advance(2_000)
+  expect(k.toasts.some(t => t.includes('keepwarm stopped, your weekly usage limit is at 95% (1 ping, $0.06)'))).toBe(true)
+  expect(k.calls.compacts.length).toBe(1)
+  await k.reply($, { read: 30_000, write: 1_000 }) // the compacted chat's next reply
+  expect(await warmCmd($)).toBe('cache-maxxing: keepwarm not started, your weekly usage limit is at 95%.')
+})
+
+test('keepwarm: a window ends on time; a ping that finds the cache gone stops it', async ($, on) => {
+  const k = warmEngine(on, { forks: [{}, { read: 0, write: 300_000 }] })
+  await start($)
+  await k.reply($, { read: 300_000, write: 0 })
+  expect(await warmCmd($, '90m')).toMatch(/^cache-maxxing: keepwarm on for 1h 30m\./)
+  for (let i = 0; i < 10; i++) await k.clock.advance(10 * MIN + 6_000)
+  expect(k.forks.length).toBe(1) // minute 101 is past the 90-minute window
+  expect(k.toasts.some(t => t.includes('keepwarm stopped, its 1.5h window ended (1 ping'))).toBe(true)
+  await warmCmd($, '2h')
+  await k.clock.advance(50 * MIN)
+  expect(k.forks.length).toBe(2)
+  expect(k.toasts.some(t => t.includes('keepwarm stopped, the ping found the cache gone (read 0, wrote 300K)'))).toBe(true)
+})
+
+test('keepwarm: a busy API is retried a minute later; nothing to fork stops it with a reason', async ($, on) => {
+  const k = warmEngine(on, { forks: [{ busy: 529 }, {}, 'nothing'] })
+  await start($)
+  await k.reply($, { read: 300_000, write: 0 })
+  await warmCmd($)
+  await k.clock.advance(50 * MIN + 2_000)
+  expect(k.forks.length).toBe(1)
+  await k.clock.advance(MIN)
+  expect(k.forks.length).toBe(2)
+  expect((await bars($))[0]).toContain('🔥 keepwarm')
+  await k.clock.advance(50 * MIN)
+  expect(k.forks.length).toBe(3)
+  expect(k.toasts.some(t => t.includes('keepwarm stopped, there was nothing to fork yet'))).toBe(true)
+})
+
+test('keepwarm: the bar button asks for how long (8h first), then turns into Stop', async ($, on) => {
+  const k = warmEngine(on, { answer: '4h' })
+  await start($)
+  const before = await $.ui.mount({ ...BAR, surface: 'desktop' })
+  expect(await before.find({ type: 'Button', key: 'warm' })).toBe(undefined) // no reply, no cache yet
+  await before.unmount()
+  await k.reply($, { read: 300_000, write: 0 })
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...BAR, surface })
+    expect((await ui.find({ type: 'Button', key: 'warm' }))?.text).toBe('🔥 Keepwarm')
+    await ui.unmount()
+  }
+  let ui = await $.ui.mount({ ...BAR, surface: 'desktop' })
+  await ui.press({ key: 'warm' })
+  await ui.unmount()
+  expect(k.asked[0]!.options).toEqual(['8h', '2h', '4h', '12h'])
+  expect(k.asked[0]!.question).toContain('each ≈ $0.06 at list prices')
+  await expectBar($, '🟢 60 min left · next message ≈ $0.06 · 300K / 1M · 🔄 Try /cmaxx-handoff or a new chat · 🔥 keepwarm 4h 00m left')
+  ui = await $.ui.mount({ ...BAR, surface: 'terminal' })
+  expect((await ui.find({ type: 'Button', key: 'warm' }))?.text).toBe('⏹ Stop keepwarm')
+  await ui.press({ key: 'warm' })
+  await ui.unmount()
+  expect(k.toasts.some(t => t.includes('keepwarm stopped, you stopped it (no pings)'))).toBe(true)
+  expect(k.asked.length).toBe(1)
+})
+
+test('keepwarm: a closed dialog starts nothing; no button on an expired chat or the 5-minute cache', async ($, on) => {
+  const k = warmEngine(on, { answer: null })
+  await start($)
+  await k.reply($, { read: 299_000, write: 1_000, ttl: 5 })
+  expect(await warmCmd($)).toBe('cache-maxxing: keepwarm needs the 1-hour cache; this chat writes the 5-minute one (Memory time in the settings).')
+  let ui = await $.ui.mount({ ...BAR, surface: 'desktop' })
+  expect(await ui.find({ type: 'Button', key: 'warm' })).toBe(undefined)
+  await ui.unmount()
+  await k.reply($, { read: 299_000, write: 1_000, ttl: 60 })
+  ui = await $.ui.mount({ ...BAR, surface: 'desktop' })
+  await ui.press({ key: 'warm' })
+  await ui.unmount()
+  expect((await bars($))[0]!.includes('🔥')).toBe(false)
+  await k.clock.advance(70 * MIN)
+  expect(await warmCmd($)).toBe('cache-maxxing: the cache is already gone, so there is nothing to keep warm. Send a message, then start keepwarm.')
+  expect(await warmCmd($, 'off')).toBe('cache-maxxing: keepwarm is not on.')
+  expect(await warmCmd($, '5m')).toBe('cache-maxxing: /cmaxx-warm takes a window from 30m to 48h, or off.')
+})
+
+test('keepwarm: /clear ends the window with its chat', async ($, on) => {
+  const k = warmEngine(on)
+  await start($)
+  await k.reply($, { read: 300_000, write: 0 })
+  await warmCmd($)
+  await $.session.end({ sessionId: 'chat-1', reason: 'clear' } as never)
+  await k.clock.advance(55 * MIN)
+  expect(k.forks.length).toBe(0)
 })

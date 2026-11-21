@@ -35,8 +35,8 @@ Open a Claude Code chat in this folder. It loads the **dev copy**, so your edits
 
 ## Rules every change keeps
 
-1. **No network and no model calls**, except `/cmaxx-update` (GETs of the upstream repository's raw files, nothing sent), `/cmaxx-handoff` (one `$.model.complete` to Haiku) and auto-compact (one `$.model.complete` to Haiku per judged reply, then `$.session.compact`). `$.http` and `$.process` appear only in the update command, and `$.model` only in the handoff and the auto-compact judgment. Never `$.model.fork`.
-2. **Never block a message.** Warn with a pop-up; never drop or rewrite what the user sends.
+1. **No network and no model calls**, except `/cmaxx-update` (GETs of the upstream repository's raw files, nothing sent), `/cmaxx-handoff` (one `$.model.complete` to Haiku), the work judgment shared by auto-compact and keepwarm (one `$.model.complete` to Haiku per judged reply), auto-compact's `$.session.compact`, and keepwarm's pings (one `$.model.fork` with a fixed prompt, only inside a window the user started). `$.http` and `$.process` appear only in the update command; `$.model.fork` only in `warmTick`.
+2. **Never block a message silently, never rewrite one.** The only hold is the cold-send question on a 🔴 chat, and only for the user's own composer messages: it asks in Claude Code's dialog, a closed dialog lets the resend through, and any error sends the message.
 3. **Fail open.** A hook that errors must never get in Claude Code's way; storage is best-effort and the bar runs from memory.
 4. **Identical text on every surface.** `tests/bar.test.tsx` draws the bar on desktop, vscode and terminal and requires the same text. A surface-specific change adds its own test and never edits the shared expectations.
 5. **Suggestions, not commands.** The bar's tips are phrased as options ("Try /cmaxx-handoff …").

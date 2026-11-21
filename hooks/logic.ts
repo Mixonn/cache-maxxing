@@ -1,6 +1,6 @@
 // Pure logic for the cache-maxxing bar: prices, TTL learning, and the rules in
 // docs/RULES.md. No $ here, so it is testable on its own and shared by every surface.
-import type { Rec } from '../types'
+import type { Rec, Warm } from '../types'
 
 export type Settings = {
   rebuildLimitUsd: number
@@ -11,6 +11,9 @@ export type Settings = {
   autoCompact: boolean
   autoCompactMinutes: number
   autoCompactLimitPercent: number
+  sendGuard: 'ask' | 'warn'
+  keepWarmHours: number
+  keepWarmLimitPercent: number
 }
 
 export const DEFAULTS: Settings = {
@@ -22,6 +25,9 @@ export const DEFAULTS: Settings = {
   autoCompact: true,
   autoCompactMinutes: 5,
   autoCompactLimitPercent: 93,
+  sendGuard: 'ask',
+  keepWarmHours: 8,
+  keepWarmLimitPercent: 93,
 }
 
 // USD per million tokens: [input, cache read], keyed by exact family-version.
@@ -259,23 +265,29 @@ export function newerReading(a: unknown, b: unknown): LimitReading | null {
 // ends after the cache expired pays the very rebuild it was meant to avoid. Not measured yet.
 export const AUTO_MIN_LEFT_MS = 60_000
 const LIMIT_WINDOWS = new Set(['five_hour', 'seven_day'])
+const LIMIT_NAME: Record<string, string> = { five_hour: '5-hour', seven_day: 'weekly' }
+
+/** The 5-hour and weekly windows at or over `percent`, leaving out one that has reset since the reading. */
+function limitsAt(reading: LimitReading | null, now: number, percent: number): Limit[] {
+  return (reading?.limits ?? []).filter(l =>
+    LIMIT_WINDOWS.has(l.kind)
+    && l.percentUsed >= percent
+    && !(l.resetsAt && Date.parse(l.resetsAt) <= now))
+}
 
 /**
  * Whether this chat should be compacted on its own now, and by which trigger: `cache` (its time is
  * nearly up) or `limit` (the account's 5-hour or weekly window is nearly used: a lock-out outlasts the cache).
+ * While keepwarm runs (`isWarming`) the cache is held, so only the limit trigger is left.
  */
-export function autoCompactDue(rec: Rec, now: number, s: Settings, reading: LimitReading | null): 'cache' | 'limit' | null {
+export function autoCompactDue(rec: Rec, now: number, s: Settings, reading: LimitReading | null, isWarming = false): 'cache' | 'limit' | null {
   if (!s.autoCompact || rec.ttlMin < 60 || rec.resetBy) return null
-  if (rec.auto === 'judged' || rec.auto === 'compacted') return null
+  if (rec.auto === 'judged' || rec.auto === 'compacted' || rec.finished === true) return null
   const left = rec.at + rec.ttlMin * 60_000 - now
   if (left < AUTO_MIN_LEFT_MS || !isBigRebuild(rec, s)) return null
-  if (left <= s.autoCompactMinutes * 60_000) return 'cache'
-  const isNearLimit = (reading?.limits ?? []).some(l =>
-    LIMIT_WINDOWS.has(l.kind)
-    && l.percentUsed >= s.autoCompactLimitPercent
-    && l.percentUsed < 100 // a used-up window cannot pay for a compaction
-    && !(l.resetsAt && Date.parse(l.resetsAt) <= now)) // that window has reset since the reading
-  return isNearLimit ? 'limit' : null
+  if (!isWarming && left <= s.autoCompactMinutes * 60_000) return 'cache'
+  // a used-up window cannot pay for a compaction
+  return limitsAt(reading, now, s.autoCompactLimitPercent).some(l => l.percentUsed < 100) ? 'limit' : null
 }
 
 /** Haiku's one word; anything else is no judgment, and no judgment means no compaction. */
@@ -312,6 +324,107 @@ export function sendWarning(rec: Rec): string {
   return `Heads-up: ${why}, so this message rebuilds the cache. See the bar for the cost.`
 }
 
+// 12 min, or 2h 05m from an hour up: a span of time in the guard and the keepwarm line
+export function span(ms: number): string {
+  const m = Math.max(0, Math.floor(ms / 60_000))
+  return m >= 60 ? `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m` : `${m} min`
+}
+
+// --- the cold-send guard (0.8.0) -----------------------------------------------------
+// Before a message goes into a 🔴 chat, Claude Code's own dialog asks: Send anyway or Don't send.
+// Ported from cache-tax (MIT), which recorded a $6.61 estimate against a $6.28 write. Same trigger
+// as the 🔴 bar, so the bar and the question never disagree.
+export const DONT_SEND = "Don't send"
+
+export function guardQuestion(rec: Rec, now: number, s: Settings): { question: string; send: string } | null {
+  if (decide(rec, now, s).light !== 'red') return null
+  const c = costs(rec)
+  const ratio = c && c.warm > 0 ? Math.round(c.cold / c.warm) : null
+  const dollars = s.costStyle === 'dollars' && c !== null
+  const why = rec.resetBy === 'model' ? 'the model changed' : rec.resetBy === 'compact' ? 'the chat was compacted'
+    : `this chat's cache expired ${span(now - rec.at - rec.ttlMin * 60_000)} ago`
+  const price = dollars
+    ? ` ≈ ${money(c.cold)} (a warm reply ≈ ${money(c.warm)}${ratio && ratio >= 2 ? `, ${ratio}× less` : ''})`
+    : ratio && ratio >= 2 ? `, about ${ratio}× a warm reply` : ''
+  const save = handoffSaving(rec.prefix, c?.cold ?? 0, { ...HAIKU_ESTIMATE, usd: haikuUsd(HAIKU_ESTIMATE.in, HAIKU_ESTIMATE.out) })
+  const tip = save.tokens > 0 && save.usd > 0 ? ` ${HANDOFF} could save ${tokens(save.tokens)} tokens${dollars ? ` | ${money(save.usd)}` : ''} instead.` : ` ${HANDOFF} or a new chat may be cheaper.`
+  const send = dollars ? `Send anyway (${money(c.cold)})` : ratio && ratio >= 2 ? `Send anyway (${ratio}× more)` : 'Send anyway'
+  return { question: `cache-maxxing: ${why}, so this message rewrites ${tokens(rec.prefix)} tokens${price}.${tip} Send it anyway?`, send }
+}
+
+export const GUARD_NOT_SENT = `cache-maxxing: not sent, nothing paid. Send it again to be asked again, or try ${HANDOFF}.`
+export const GUARD_CLOSED = `cache-maxxing: not sent, the question was closed. Send it again to pay the rebuild, or try ${HANDOFF}.`
+
+// --- keepwarm (0.8.0) ------------------------------------------------------------------
+// Started from the bar or /cmaxx-warm, for a window (8h by default). Ten minutes before the cache
+// expires, one tool-less fork of the chat reads the cache and so restarts its hour; it stops early
+// when Haiku judges the work finished, at the usage limit, or when a ping finds the cache gone.
+// Ported from cache-tax (MIT): its fork at minute 50 read 157K and reset the hour, measured
+// 19 September 2026 on a subscription (its README, "Limits"). One run there, not measured here.
+export type { Warm }
+
+export const PING_LEAD_MS = 10 * 60_000 // cache-tax's 50-minute ping on the 1h cache
+export const PING_PROMPT = 'Reply with the single word: warm'
+const WARM_WRITE_SHARE = 0.1 // cache-tax's threshold: a ping writing a tenth of what it read found the cache gone
+const WARM_MIN_MS = 30 * 60_000
+const WARM_MAX_MS = 48 * 60 * 60_000
+
+/** What keepwarm does on this tick: ping, ask Haiku first, stop (and why), or wait. */
+export function keepWarmStep(rec: Rec | null, now: number, w: Warm, s: Settings, reading: LimitReading | null): 'ping' | 'judge' | { stop: string } | null {
+  if (now >= w.until) return { stop: `its ${w.hours}h window ended` }
+  const over = limitsAt(reading, now, s.keepWarmLimitPercent).sort((a, b) => b.percentUsed - a.percentUsed)[0]
+  if (over) return { stop: `your ${LIMIT_NAME[over.kind]} usage limit is at ${Math.round(over.percentUsed)}%` }
+  if (!rec) return null
+  if (rec.finished === true) return { stop: 'the work looks finished' }
+  if (rec.resetBy) return null // the next reply writes the new cache; pinging the old one would pay that write now
+  if (rec.ttlMin < 60) return { stop: 'it needs the 1-hour cache' }
+  const left = rec.at + rec.ttlMin * 60_000 - now
+  // a ping this late may land after the cache is gone and pay the very rewrite it exists to avoid
+  if (left < AUTO_MIN_LEFT_MS) return { stop: 'the cache had already expired' }
+  if (left > PING_LEAD_MS) return null
+  return rec.finished === undefined ? 'judge' : 'ping'
+}
+
+type PingUsage = { input_tokens?: number; output_tokens?: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }
+
+export function isWarmPing(u: PingUsage): boolean {
+  return u.cache_read_input_tokens > 0 && u.cache_creation_input_tokens < WARM_WRITE_SHARE * u.cache_read_input_tokens
+}
+
+// A ping's cost: the cache read, a small 1h write, its own few input tokens, and the answer, at
+// 5x input (the output rate of every priced model). null for a model with no price.
+export function pingUsd(model: string, u: PingUsage): number | null {
+  const input = u.input_tokens ?? 0
+  const p = priceOf(model, input + u.cache_read_input_tokens + u.cache_creation_input_tokens)
+  if (!p) return null
+  return (u.cache_read_input_tokens * p.read + u.cache_creation_input_tokens * p.input * 2 + input * p.input + (u.output_tokens ?? 0) * p.input * 5) / 1e6
+}
+
+export function warmLine(w: Warm, now: number): string {
+  return `🔥 keepwarm ${span(w.until - now)} left${w.pings ? ` · ${w.pings} ping${w.pings === 1 ? '' : 's'} ${money(w.usd)}` : ''}`
+}
+
+/** The window choices in the dialog: the default first, then the others from short to long. */
+export function warmChoices(defaultHours: number): string[] {
+  const others = [2, 4, 8, 12].filter(h => h !== defaultHours).slice(0, 3)
+  return [`${defaultHours}h`, ...others.map(h => `${h}h`)]
+}
+
+/** /cmaxx-warm's argument: nothing (the default window), 3h, 90m, 2h30m, a bare number of hours, or off. */
+export function parseWarmArg(arg: string, defaultHours: number): { ms: number } | 'off' | { error: string } {
+  const a = arg.trim().toLowerCase()
+  if (a === 'off' || a === 'stop') return 'off'
+  const t = a === '' ? String(defaultHours) : a.replace(/\s+/g, '')
+  // a bare number is hours; otherwise h needs its letter, so "90m" never reads as 9h 0m
+  const m = /^(\d+(?:\.\d+)?)$/.exec(t) ?? /^(?:(\d+(?:\.\d+)?)h)?(?:(\d+)m)?$/.exec(t)
+  const ms = m && (m[1] || m[2]) ? Number(m[1] ?? 0) * 3_600_000 + Number(m[2] ?? 0) * 60_000 : NaN
+  return ms >= WARM_MIN_MS && ms <= WARM_MAX_MS ? { ms } : { error: 'a window from 30m to 48h, or off' }
+}
+
+export function keepWarmStopped(reason: string, w: Warm): string {
+  return `cache-maxxing: keepwarm stopped, ${reason} (${w.pings ? `${w.pings} ping${w.pings === 1 ? '' : 's'}, ${money(w.usd)}` : 'no pings'}).`
+}
+
 // Fills in a record for a chat this plugin never saw reply (older chats), from
 // what Claude Code says at session start. Nothing is learned from it (read/write 0).
 export function fromSessionStart(
@@ -336,6 +449,9 @@ export function readSettings(o: Record<string, unknown>): Settings {
     autoCompact: o.autoCompact !== 'off',
     autoCompactMinutes: num(o.autoCompactMinutes, DEFAULTS.autoCompactMinutes),
     autoCompactLimitPercent: num(o.autoCompactLimitPercent, DEFAULTS.autoCompactLimitPercent),
+    sendGuard: o.sendGuard === 'warn' ? 'warn' : 'ask',
+    keepWarmHours: Math.min(48, num(o.keepWarmHours, DEFAULTS.keepWarmHours)),
+    keepWarmLimitPercent: num(o.keepWarmLimitPercent, DEFAULTS.keepWarmLimitPercent),
   }
 }
 
@@ -351,6 +467,8 @@ export type Stats = {
   rebuildUsd: number
   handoffs: number
   autoCompacts: number // chats this plugin compacted on its own
+  pings: number // keepwarm pings sent
+  pingUsd: number // what they cost at list prices
   savedTokens: number // the handoff notice's own figures, counted only when the cache had expired
   savedUsd: number
   chats?: number // all chats only
@@ -359,9 +477,9 @@ export type Stats = {
   retired?: boolean // pruned after 90 days: its counts live on in st:retired, it counts as a chat there
 }
 
-const COUNTS = ['replies', 'read', 'write', 'input', 'rebuilds', 'rebuildTokens', 'rebuildUsd', 'handoffs', 'autoCompacts', 'savedTokens', 'savedUsd', 'chats'] as const
+const COUNTS = ['replies', 'read', 'write', 'input', 'rebuilds', 'rebuildTokens', 'rebuildUsd', 'handoffs', 'autoCompacts', 'pings', 'pingUsd', 'savedTokens', 'savedUsd', 'chats'] as const
 
-export const emptyStats = (now: number): Stats => ({ since: now, replies: 0, read: 0, write: 0, input: 0, rebuilds: 0, rebuildTokens: 0, rebuildUsd: 0, handoffs: 0, autoCompacts: 0, savedTokens: 0, savedUsd: 0 })
+export const emptyStats = (now: number): Stats => ({ since: now, replies: 0, read: 0, write: 0, input: 0, rebuilds: 0, rebuildTokens: 0, rebuildUsd: 0, handoffs: 0, autoCompacts: 0, pings: 0, pingUsd: 0, savedTokens: 0, savedUsd: 0 })
 
 // Adds `d` to `s`; an unreadable stored value counts as empty, never NaN.
 export function addStats(s: unknown, d: Partial<Stats>, now: number): Stats {
@@ -393,6 +511,7 @@ export function statsText(chat: Stats, all: Stats, s: Settings): string {
     ['Cache hit rate', hit],
     ['Handoffs', x => String(x.handoffs)],
     ['Auto-compacts', x => String(x.autoCompacts)],
+    ['Keepwarm pings', x => `${x.pings}${x.pings && dollars ? ` (${usd(x.pingUsd)})` : ''}`],
     ['Cold rebuilds paid', rebuilds],
     ['Replies', x => String(x.replies)],
   ]

@@ -7,7 +7,8 @@ import type { Rec } from '../types'
 import { assembleBrief, briefPrompt, extractFacts, handoffPath, isValidBrief, parseSkill, renderTranscript, savingsLine, seedLine, transcriptGuess } from './handoff'
 import type { Numbers } from './handoff'
 import { COMPACT_INSTRUCTIONS, JUDGE_CLOSING, JUDGE_SYSTEM, PRICES_DATE, WAITING, autoCompactDue, autoCompactNotice, newerReading, parseJudgment, isDevCopy, addStats, bundledPrices, costs, decide, fromSessionStart, haikuUsd, handoffSaving, newerVersion, priceOf, readSettings, sendWarning, setFreshStart, setPriceOverride, statsFromTranscript, statsText, sumStats, ttlFor, ttlFromUsage, validatePrices } from './logic'
-import type { LimitReading, Settings, Stats } from './logic'
+import { DONT_SEND, GUARD_CLOSED, GUARD_NOT_SENT, PING_LEAD_MS, PING_PROMPT, guardQuestion, isWarmPing, keepWarmStep, keepWarmStopped, money, parseWarmArg, pingUsd, span, tokens, warmChoices, warmLine } from './logic'
+import type { LimitReading, Settings, Stats, Warm } from './logic'
 
 const KEEP_MS = 7 * 24 * 60 * 60 * 1000 // saved chats older than this are pruned; an older chat refills on resume
 const STATS_KEEP_MS = 90 * 24 * 60 * 60 * 1000 // a chat's /cmaxx-stats counts (your call); then folded into st:retired
@@ -32,6 +33,14 @@ const hidden = atom({ plugin: 'cache-maxxing', key: 'hidden' } as const, false)
 // The 🔴 bar's handoff button while its handoff is being written (Haiku may take a minute).
 const writing = atom({ plugin: 'cache-maxxing', key: 'writing' } as const, false)
 let isHandoffBusy = false // one handoff at a time, from the command or the button
+// This chat's keepwarm window, or null (0.8.0). In memory only: a restart or /clear ends it.
+const warm = atom({ plugin: 'cache-maxxing', key: 'warm' } as const, null as Warm | null)
+let isWarmBusy = false // one judgment or ping at a time
+let warmRetries = 0 // a busy API (429, 5xx) is tried again after 1, 2 and 4 minutes
+let warmNextTryAt = 0
+const WARM_RETRIES = 3
+// The cold-send guard's question was closed for this reply: the resend pays, as cache-tax does.
+let guardAckFor: number | undefined
 
 // Module variables survive /clear ($.state does not): the handoff line waiting for the
 // fresh chat, and the transcript path from the latest SessionStart.
@@ -174,28 +183,53 @@ async function markAuto($: EngineInterface, at: number, patch: Partial<Rec>) {
   return now && now.at === at ? now : null
 }
 
-// Asks Haiku once whether the work is finished, then compacts an unfinished chat in place.
+// Asks Haiku once per reply whether the work is finished: auto-compact and keepwarm share the answer
+// on the record (`finished`). Marked null before the call, so an error or a restart never asks twice.
+// Answers the verdict, or undefined when a newer reply replaced the one asked about.
+// A question still out is shared: its null mark would otherwise read as "no judgment" to the other caller.
+let judging: { at: number; p: Promise<boolean | null | undefined> } | undefined
+function judgeWork($: EngineInterface, at: number): Promise<boolean | null | undefined> {
+  if (judging?.at === at) return judging.p
+  const p = askHaiku($, at).finally(() => { if (judging?.p === p) judging = undefined })
+  judging = { at, p }
+  return p
+}
+async function askHaiku($: EngineInterface, at: number): Promise<boolean | null | undefined> {
+  if (!(await markAuto($, at, { finished: null }))) return undefined
+  const r = await $.model.complete({
+    model: 'haiku',
+    system: JUDGE_SYSTEM,
+    prompt: `${renderTranscript((await $.session.messages()).slice(-JUDGE_MESSAGES)).slice(-JUDGE_CHARS)}\n\n---\n\n${JUDGE_CLOSING}`,
+    effort: 'low',
+    maxTokens: 200,
+    timeoutMs: 30_000,
+  })
+  const verdict = parseJudgment(r.isAnswered ? r.text : '')
+  if (!verdict) $.ui.log(`cache-maxxing: no judgment of the work (${r.isAnswered ? 'unclear answer' : r.reason})`, { to: 'debug' })
+  const finished = verdict ? verdict === 'finished' : null
+  await markAuto($, at, { finished })
+  return finished
+}
+
+const isWarming = async ($: EngineInterface) => !!(await read($, warm))
+
+// Compacts an unfinished chat in place, once Haiku has judged it unfinished.
 // Every way out leaves a mark on the record, so the ticker never asks twice about one reply.
 async function autoCompact($: EngineInterface, rec: Rec, settings: Settings) {
   const log = (text: string) => $.ui.log(`cache-maxxing: auto-compact ${text}`, { to: 'debug' })
   if (rec.auto !== 'due') {
-    // marked before the model call: an error or a restart mid-way must not ask again
-    if (!(await markAuto($, rec.at, { auto: 'judged' }))) return
-    const r = await $.model.complete({
-      model: 'haiku',
-      system: JUDGE_SYSTEM,
-      prompt: `${renderTranscript((await $.session.messages()).slice(-JUDGE_MESSAGES)).slice(-JUDGE_CHARS)}\n\n---\n\n${JUDGE_CLOSING}`,
-      effort: 'low',
-      maxTokens: 200,
-      timeoutMs: 30_000,
-    })
-    const verdict = parseJudgment(r.isAnswered ? r.text : '')
-    if (verdict !== 'unfinished') return log(verdict ? 'skipped: the work looks finished' : `skipped: no judgment (${r.isAnswered ? 'unclear answer' : r.reason})`)
+    // keepwarm may have asked already, for this same reply
+    const finished = rec.finished === undefined || judging?.at === rec.at ? await judgeWork($, rec.at) : rec.finished
+    if (finished === undefined) return
+    if (finished !== false) {
+      await markAuto($, rec.at, { auto: 'judged' })
+      return log(finished ? 'skipped: the work looks finished' : 'skipped: no judgment')
+    }
     if (!(await markAuto($, rec.at, { auto: 'due' }))) return
   }
   // Haiku took a while: only if this is still the same reply and its cache is still warm enough
   const live = await read($, last)
-  const why = live && live.at === rec.at ? autoCompactDue(live, await $.clock.now(), settings, reading) : null
+  const why = live && live.at === rec.at ? autoCompactDue(live, await $.clock.now(), settings, reading, await isWarming($)) : null
   if (!live || !why) return
   let res
   try {
@@ -329,6 +363,104 @@ async function pressHandoff($: EngineInterface, settings: Settings) {
   }
 }
 
+// --- keepwarm (0.8.0) ------------------------------------------------------------------
+// One tool-less fork of the chat (cache-tax's mechanism), ten minutes before the cache expires:
+// it reads the cache, which restarts its hour. The only $.model.fork in this plugin.
+
+// A ping's likely cost, from the chat's size: the read plus a few tokens each way.
+const pingEstimate = (rec: Rec) => pingUsd(rec.model, { input_tokens: 20, output_tokens: 5, cache_read_input_tokens: rec.prefix, cache_creation_input_tokens: 0 })
+
+/** Starts (or restarts) the window; answers the line to show. */
+async function startWarm($: EngineInterface, ms: number, settings: Settings): Promise<string> {
+  const rec = await read($, last)
+  const now = await $.clock.now()
+  if (!(await isChat($))) return 'cache-maxxing: keepwarm runs only in a chat.'
+  if (!rec) return 'cache-maxxing: keepwarm starts after the first reply: there is no cache to keep warm yet.'
+  if (rec.ttlMin < 60) return 'cache-maxxing: keepwarm needs the 1-hour cache; this chat writes the 5-minute one (Memory time in the settings).'
+  if (rec.resetBy || rec.at + rec.ttlMin * 60_000 <= now) return 'cache-maxxing: the cache is already gone, so there is nothing to keep warm. Send a message, then start keepwarm.'
+  const w: Warm = { until: now + ms, hours: Math.round((ms / 3_600_000) * 10) / 10, pings: 0, usd: 0 }
+  // a window that would stop on its first tick (the usage limit) is not started at all
+  const step = keepWarmStep({ ...rec, finished: false }, now, w, settings, reading)
+  if (step && typeof step === 'object') return `cache-maxxing: keepwarm not started, ${step.stop}.`
+  // an explicit start asks Haiku afresh: an earlier "finished" may be what the user disagrees with
+  if (rec.finished === true) await markAuto($, rec.at, { finished: undefined })
+  await update($, warm, () => w)
+  warmRetries = 0
+  warmNextTryAt = 0
+  const usd = pingEstimate(rec)
+  const each = usd !== null && settings.costStyle === 'dollars' ? `, each ≈ ${money(usd)}` : ''
+  return `cache-maxxing: keepwarm on for ${span(ms)}. A ping ${span(PING_LEAD_MS)} before the cache expires keeps it warm${each}. It stops early when the work looks finished or your usage limit reaches ${settings.keepWarmLimitPercent}%.`
+}
+
+/** Ends the window; answers the notice (also shown as a pop-up unless `quiet`). */
+async function stopWarm($: EngineInterface, reason: string, quiet = false): Promise<string | undefined> {
+  const w = await read($, warm)
+  if (!w) return undefined
+  await update($, warm, () => null)
+  warmRetries = 0
+  warmNextTryAt = 0
+  const text = keepWarmStopped(reason, w)
+  $.ui.log(text, { to: 'debug' })
+  if (!quiet) $.ui.toast(text)
+  return text
+}
+
+// One keepwarm step from the ticker: judge, ping, stop or nothing (keepWarmStep decides).
+async function warmTick($: EngineInterface, w: Warm, rec: Rec, settings: Settings) {
+  const sentAt = await $.clock.now()
+  const step = keepWarmStep(rec, sentAt, w, settings, reading)
+  if (!step) return
+  if (typeof step === 'object') return void (await stopWarm($, step.stop))
+  if (step === 'judge') return void (await judgeWork($, rec.at)) // the next tick acts on the verdict
+  const sent = await $.model.fork({ prompt: PING_PROMPT }).then(reply => ({ reply }), (err: unknown) => ({ err }))
+  // stopped meanwhile, or a reply of the user's own refreshed the cache: this ping's answer is moot
+  const live = await read($, last)
+  if (!(await read($, warm)) || !live || live.at !== rec.at) return
+  if ('err' in sent) return void (await stopWarm($, `the ping failed (${errText(sent.err)})`))
+  const reply = sent.reply
+  if (!reply) return void (await stopWarm($, 'the engine did not send the ping'))
+  if (!reply.isAnswered) {
+    // a restarted app has no conversation to fork until its first turn
+    if (reply.reason === 'nothing-to-fork') return void (await stopWarm($, 'there was nothing to fork yet; send a message and start it again'))
+    const isBusy = reply.reason === 'api-error' && (reply.status === null || reply.status === 429 || reply.status >= 500)
+    const left = rec.at + rec.ttlMin * 60_000 - sentAt
+    const wait = 60_000 * 2 ** warmRetries
+    if (isBusy && warmRetries < WARM_RETRIES && wait < left - 60_000) {
+      warmRetries++
+      warmNextTryAt = sentAt + wait
+      return $.ui.log(`cache-maxxing: keepwarm ping refused (API busy), retry ${warmRetries} of ${WARM_RETRIES} in ${span(wait)}`, { to: 'debug' })
+    }
+    const why = reply.reason === 'api-error' ? `the API call failed${reply.status === null ? '' : ` (${reply.status})`}` : reply.reason === 'aborted' ? 'the ping was interrupted' : 'the ping returned nothing'
+    return void (await stopWarm($, why))
+  }
+  const u = reply.usage
+  const usd = pingUsd(rec.model, u) ?? 0
+  await update($, warm, x => (x ? { ...x, pings: x.pings + 1, usd: x.usd + usd, lastPingUsd: usd } : x))
+  await count($, { pings: 1, pingUsd: usd }).catch(() => {})
+  await flush($).catch(() => {})
+  if (!isWarmPing(u)) return void (await stopWarm($, `the ping found the cache gone (read ${tokens(u.cache_read_input_tokens)}, wrote ${tokens(u.cache_creation_input_tokens)})`))
+  warmRetries = 0
+  // the cache's hour restarts when the ping's request starts: the bar counts down from there
+  await markAuto($, rec.at, { at: sentAt, warned: false })
+}
+
+// The bar's 🔥 button: Claude Code's own dialog asks for how long; ⏹ stops it.
+async function pressWarm($: EngineInterface, settings: Settings) {
+  if (await read($, warm)) return void (await stopWarm($, 'you stopped it'))
+  const rec = await read($, last)
+  const usd = rec && settings.costStyle === 'dollars' ? pingEstimate(rec) : null
+  const choices = warmChoices(settings.keepWarmHours)
+  let pick: string | null
+  try {
+    pick = await $.ui.ask(`Keep this chat's cache warm while you are away? A ping about every ${span(60 * 60_000 - PING_LEAD_MS)}${usd !== null ? `, each ≈ ${money(usd)} at list prices` : ''}. It stops early when the work looks finished or your usage limit reaches ${settings.keepWarmLimitPercent}%.`, { header: 'Keepwarm', options: choices })
+  } catch {
+    pick = null
+  }
+  if (pick === null) return // closed: nothing starts
+  const p = parseWarmArg(pick, settings.keepWarmHours)
+  if (typeof p === 'object' && 'ms' in p) $.ui.toast(await startWarm($, p.ms, settings))
+}
+
 export const register: Register = (on, options) => {
   const settings = readSettings(options as Record<string, unknown>)
 
@@ -340,6 +472,7 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'cmaxx-handoff', description: 'Summarize this chat with Haiku (the expired cache is never resent) and start a fresh chat from it' })
     await $.command.register({ name: 'cmaxx-update', description: 'Update cache-maxxing to the latest version, or refresh its model prices (reads this plugin\'s GitHub files; sends nothing)' })
     await $.command.register({ name: 'cmaxx-stats', description: 'Show what cache-maxxing counted: handoff savings, cold rebuilds, cache hit rate, for this chat and all chats' })
+    await $.command.register({ name: 'cmaxx-warm', description: 'Keep this chat\'s cache warm while you are away (8h by default, e.g. /cmaxx-warm 3h), or /cmaxx-warm off' })
     // Each second: redraw the bar (it computes from the wall clock, so sleep or a
     // paused timer can't drift it) and pop up once when a big chat's cache expires.
     $.clock.every(1000, () => {
@@ -356,13 +489,24 @@ export const register: Register = (on, options) => {
           const now = await read($, last)
           if (now && now.at === rec.at) await $.store.set(`cmx:${await $.session.id()}`, now).catch(() => {})
         }
-        // auto-compact: a big unfinished chat, while its cache is still warm
-        if (!settings.autoCompact || isAutoBusy || !(await isChat($))) return
+        const w = await read($, warm)
+        if ((!settings.autoCompact && !w) || !(await isChat($))) return
         if (at - readingAt >= SHARED_READING_MS) {
           readingAt = at
           reading = newerReading(ownReading, await $.store.get('rl').catch(() => undefined))
         }
-        if (!autoCompactDue(rec, at, settings, reading) || at - autoTriedAt < AUTO_RETRY_MS) return
+        // keepwarm first: when it stops at the limit, auto-compact's limit trigger may act on the same tick
+        if (w && !isWarmBusy && at >= warmNextTryAt) {
+          isWarmBusy = true
+          try {
+            await warmTick($, w, rec, settings)
+          } finally {
+            isWarmBusy = false
+          }
+        }
+        // auto-compact: a big unfinished chat, while its cache is still warm
+        if (!settings.autoCompact || isAutoBusy) return
+        if (!autoCompactDue(rec, at, settings, reading, await isWarming($)) || at - autoTriedAt < AUTO_RETRY_MS) return
         isAutoBusy = true
         autoTriedAt = at
         try {
@@ -485,14 +629,38 @@ export const register: Register = (on, options) => {
     return next(e)
   }).catch(($, e, next) => next(e)) // fail open: never get in Claude Code's way
 
-  // Warns (never blocks) when you send into a red chat.
+  // A message typed into a 🔴 chat: asks Send anyway / Don't send first (sendGuard ask, 0.8.0), or
+  // warns and sends (warn). Only the user's own composer messages; anything else always goes through.
   on('prompt.submit', async ($, e, next) => {
-    if (e.origin.kind === 'composer' && !e.command && !(await read($, hidden))) {
-      const rec = await read($, last)
-      if (rec && decide(rec, await $.clock.now(), settings).light === 'red') $.ui.toast(sendWarning(rec))
+    if (e.origin.kind !== 'composer' || e.command) return next(e)
+    const rec = await read($, last)
+    if (!rec) return next(e)
+    const now = await $.clock.now()
+    if (settings.sendGuard === 'warn') {
+      if (!(await read($, hidden)) && decide(rec, now, settings).light === 'red') $.ui.toast(sendWarning(rec))
+      return next(e)
     }
-    return next(e)
-  }).catch(($, e, next) => next(e))
+    const q = guardQuestion(rec, now, settings)
+    if (!q) return next(e)
+    // the question for this reply was closed once: this resend pays, nobody is asked twice
+    if (guardAckFor === rec.at) {
+      guardAckFor = undefined
+      return next(e)
+    }
+    let answer: string | null
+    try {
+      answer = await $.ui.ask(q.question, { header: 'cache-maxxing', options: [q.send, DONT_SEND] })
+    } catch {
+      answer = null
+    }
+    // the answer can take minutes: a /clear meanwhile means the message belongs to a chat that is gone
+    const after = await read($, last)
+    if (after?.at !== rec.at) return { drop: 'cache-maxxing: the chat changed while the question was open, so this was not sent. Send it again.' }
+    if (answer === q.send) return next(e)
+    if (answer !== null) return { drop: GUARD_NOT_SENT }
+    guardAckFor = rec.at
+    return { drop: GUARD_CLOSED }
+  }).catch(($, e, next) => next(e)) // fail open: an error never holds a message
 
   // The account's rate-limit windows, shared with this plugin's idle chats: each knows only
   // what its own last reply reported, and the limit trigger needs the newest reading.
@@ -509,8 +677,17 @@ export const register: Register = (on, options) => {
     // the chat is leaving this process (clear, resume into another, exit): drop the
     // in-memory record so the next chat never shows this one's; the store keeps it
     await update($, last, () => null)
+    await stopWarm($, 'the chat ended', true).catch(() => {}) // a window belongs to its chat
+    guardAckFor = undefined
     await flush($).catch(() => {})
     return next(e)
+  })
+
+  on('command.run', { command: 'cmaxx-warm' }, async ($, e) => {
+    const p = parseWarmArg(String((e as { args?: unknown }).args ?? ''), settings.keepWarmHours)
+    if (p === 'off') return { text: (await stopWarm($, 'you stopped it', true)) ?? 'cache-maxxing: keepwarm is not on.' }
+    if ('error' in p) return { text: `cache-maxxing: /cmaxx-warm takes ${p.error}.` }
+    return { text: await startWarm($, p.ms, settings) }
   })
 
   // a turn's /cmaxx-stats counts are written once, when it ends
@@ -610,9 +787,13 @@ export const register: Register = (on, options) => {
     if (await read($, hidden)) return next(e)
     const rec = await read($, last)
     await read($, tick) // subscribe so the bar redraws every second
-    const verdict = rec ? decide(rec, await $.clock.now(), settings) : null
-    const text = verdict?.text ?? WAITING
+    const now = await $.clock.now()
+    const verdict = rec ? decide(rec, now, settings) : null
+    const w = await read($, warm)
+    const text = verdict ? (w ? `${verdict.text} · ${warmLine(w, now)}` : verdict.text) : WAITING
     const isWriting = await read($, writing)
+    // 🔥 while the cache is warm and on its 1-hour lifetime; ⏹ for as long as a window runs
+    const canWarm = !!rec && rec.ttlMin >= 60 && (verdict?.light === 'green' || verdict?.light === 'yellow')
     const { Box, Button, Text } = $.ui.resolve(e)
     // text wraps on the left; ✕ stays pinned top-right however many lines it takes.
     // nowrap + minWidth 0: VS Code's webview otherwise wraps the ✕ onto its own line (P2)
@@ -623,6 +804,9 @@ export const register: Register = (on, options) => {
         </Box>
         {verdict?.light === 'red' || isWriting ? (
           <Button key="handoff" label={isWriting ? '⏳ Writing…' : '🔄 Handoff'} onPress={() => (isWriting ? undefined : pressHandoff($, settings))} />
+        ) : null}
+        {w || canWarm ? (
+          <Button key="warm" label={w ? '⏹ Stop keepwarm' : '🔥 Keepwarm'} onPress={() => pressWarm($, settings)} />
         ) : null}
         <Button key="close" label="✕" plain dimColor onPress={() => update($, hidden, () => true)} />
       </Box>

@@ -16,7 +16,7 @@
 
 ## About
 
-> **This is a fork** of [5m0k3/cache-maxxing](https://github.com/5m0k3/cache-maxxing). It adds two things: **auto-compact** (a big chat whose work is not finished compacts itself shortly before its cache expires, or when your usage limit is nearly reached, so the chat you come back to is small and cheap to continue) and a **🔄 Handoff** button on the 🔴 bar. `/cmaxx-update` checks this fork's version; the price list still comes from the original, where it is maintained. Everything else is the original plugin.
+> **This is a fork** of [5m0k3/cache-maxxing](https://github.com/5m0k3/cache-maxxing). It adds four things: **auto-compact** (a big chat whose work is not finished compacts itself shortly before its cache expires, or when your usage limit is nearly reached, so the chat you come back to is small and cheap to continue), a **🔄 Handoff** button on the 🔴 bar, **🔥 keepwarm** (one click keeps a chat's cache warm while you are away, and stops by itself when the work is done or your usage limit is near) and a **question before an expensive message** (Send anyway or Don't send, with the price). Keepwarm and the question are ported from [karanb192/cache-tax](https://github.com/karanb192/cache-tax) (MIT). `/cmaxx-update` checks this fork's version; the price list still comes from the original, where it is maintained. Everything else is the original plugin.
 
 Ever feel like your Claude subscription quota disappears way faster than it should? Usually, it's not how **much** you're building - it's **when** you hit Send.
 
@@ -42,12 +42,14 @@ Claude keeps your chat "warm" only for a while so follow-up messages barely dent
 | ⏱️ **Live countdown** | Minutes left on the cache, ticking every second; it survives restarts, sleep and switching chats. |
 | 💲 **Next-message cost** | In dollars (API prices) or as "× more" (better for subscriptions), plus how full the chat is (`290K / 1M`). |
 | 🚦 **One clear tip** | 🟢 keep going · 🟡 reply soon · 🟠 expired small chat, fine · 🔴 expired, with what a handoff would save. |
-| 🔔 **One pop-up** | A single warning when a big chat's cache expires, and a heads-up if you send into it. Your message is never stopped. |
+| 🔔 **One pop-up** | A single warning when a big chat's cache expires. |
+| 🛑 **Ask before an expensive message** | Typing into a 🔴 chat, Claude Code first asks **Send anyway ($2.32)** or **Don't send**. Set it to `warn` for a pop-up only. |
+| 🔥 **Keepwarm** | One click on the bar (or `/cmaxx-warm`) keeps the cache warm while you are away, 8 hours by default. It stops by itself when the work looks finished or your usage limit reaches 93%. |
 | 🗜️ **Auto-compact** | Walk away mid-task: 5 minutes before the cache expires, Haiku judges whether the work is finished, and an unfinished chat is compacted in place. A finished chat is left alone. |
 | 🔄 **`/cmaxx-handoff`** | Haiku (effort: High) writes a briefing of the chat; a fresh chat picks up from it. The expired chat is never resent to the main model. On the 🔴 bar it is also a **🔄 Handoff** button. |
 | 📊 **`/cmaxx-stats`** | Money and tokens saved, cache hit rate, rebuilds paid: for this chat and for all chats. |
 | ⬆️ **`/cmaxx-update`** | Updates the plugin, or at least its model and price list, so new models are priced on day one. |
-| 🔒 **Local by default** | No network. Model calls only from the two commands above, when you run them, and from auto-compact, which you can turn off. |
+| 🔒 **Local by default** | No network. Model calls only from the two commands above, when you run them, from keepwarm, when you start it, and from auto-compact, which you can turn off. |
 
 
 ## Install
@@ -79,6 +81,10 @@ Answer `y` to add the marketplace and press Enter for the user scope. The bar sh
 | `/cmaxx` | Hide or show the bar in this chat (the **✕** on the bar hides it too). |
 | `/cmaxx-handoff` | Write a briefing of this chat with Haiku and start a fresh chat from it. (Doesn't trigger the old chat's model) |
 | **🔄 Handoff** button | The same, in one click, on the 🔴 bar: a big chat whose cache has expired. |
+| `/cmaxx-warm` | Keep this chat's cache warm: `/cmaxx-warm` (8h, or your default), `/cmaxx-warm 3h`, `90m`, `2h30m`; `/cmaxx-warm off` stops it. |
+| **🔥 Keepwarm** button | The same from the bar: asks for how long (8h first), then turns into **⏹ Stop keepwarm**. |
+| `/cmaxx-stats` | Show savings, cache hit rate, rebuilds, keepwarm pings and replies: this chat and all chats. |
+| `/cmaxx-update` | Update to the latest version, or refresh the model and price list. |
 
 **The handoff button.** You forgot about a big chat and its cache expired: sending a message now would re-read all of it at full price. Click **🔄 Handoff** on the 🔴 bar instead. Haiku reads the chat from your disk (never the expired cache) and writes a briefing: the goal, decisions, what failed, the next steps. Then:
 
@@ -86,8 +92,8 @@ Answer `y` to add the marketplace and press Enter for the user scope. The bar sh
 - **Terminal and VS Code:** the chat clears to a fresh one with that line already in the box; send it.
 
 While the briefing is written (up to a minute), the button reads **⏳ Writing…**. It costs about a cent of Haiku. The button shows only on 🔴: on 🟠 the chat is small and simply carrying on is cheap.
-| `/cmaxx-stats` | Show savings, cache hit rate, rebuilds and replies: this chat and all chats. |
-| `/cmaxx-update` | Update to the latest version, or refresh the model and price list. |
+
+**The keepwarm button.** You are stepping away from a big chat mid-task and want it exactly as it is when you come back. Click **🔥 Keepwarm** on the 🟢 or 🟡 bar and pick a window. The bar then ends with `🔥 keepwarm 7h 09m left · 1 ping $0.06`, and the button reads **⏹ Stop keepwarm**. See [Keepwarm](#keepwarm).
 
 What each light means, the exact texts and the rules behind them: [How the bar decides](#how-the-bar-decides).
 
@@ -105,6 +111,9 @@ In the plugin's settings, under cache-maxxing:
 | Auto-compact | on | `off` never compacts a chat by itself. |
 | Auto-compact: minutes left | 5 | How long before the cache expires an unfinished chat is compacted. |
 | Auto-compact: usage limit (%) | 93 | At this much of your 5-hour or weekly limit, unfinished chats are compacted at once. |
+| Before an expensive message | ask | `ask`: on the 🔴 bar Claude Code asks Send anyway or Don't send first. `warn`: a pop-up only, the message always goes out. |
+| Keepwarm: default hours | 8 | The window the 🔥 button offers first and `/cmaxx-warm` uses with no argument (up to 48). |
+| Keepwarm: usage limit (%) | 93 | Keepwarm stops at this much of your 5-hour or weekly limit. |
 
 ## Keep it updated
 
@@ -169,10 +178,53 @@ What it costs: Haiku's judgment is a fraction of a cent. The compaction is done 
 | `claude -p`, the SDK, subagents | Never. |
 | Auto-compact is `off` | Never; the rest of the plugin works as in the original. |
 
+## Before an expensive message
+
+When the bar is 🔴 (the cache expired or was reset, and rebuilding it costs more than the rebuild limit), a message you type is held and Claude Code's own dialog asks:
+
+```
+cache-maxxing: this chat's cache expired 1h 00m ago, so this message rewrites 290K tokens ≈ $2.32 (a warm reply ≈ $0.06, 40× less). /cmaxx-handoff could save 232K tokens | $2.21 instead. Send it anyway?
+[Send anyway ($2.32)]  [Don't send]
+```
+
+- **Send anyway** sends the message unchanged.
+- **Don't send** drops it; nothing is paid. Sending it again asks again.
+- **Closing the dialog** drops it once; sending it again goes through without asking, as you have seen the price.
+- Only messages you type are asked about: slash commands, `claude -p`, the SDK, scheduled and background prompts always go through.
+- If anything in the plugin fails, the message goes through.
+
+Set **Before an expensive message** to `warn` for the original behaviour: a pop-up, and the message always goes out.
+
+## Keepwarm
+
+A chat's cache lives an hour after its last request. Keepwarm sends one tiny request, a *ping*, 10 minutes before it would expire: a tool-less fork of the chat asked to reply with one word. The ping reads the whole cache, which restarts its hour, and costs about one cache read (`300K` tokens on Opus 5.5 ≈ $0.06 at list prices), against ≈ $2.40 to rebuild that chat cold. The fork answers into nothing: your chat never shows it. Ported from cache-tax, whose measured run shows a fork at minute 50 resetting the hour on a subscription.
+
+Before the first ping after each of your replies, Haiku judges whether the work is finished (the same judgment auto-compact uses, asked once per reply and shared between the two).
+
+### What happens when
+
+| Situation | What keepwarm does |
+|---|---|
+| You start it and leave mid-task | Haiku judges the work unfinished; a ping every ~50 minutes keeps the cache warm until the window ends. |
+| The work is finished (request answered, pull request opened, nothing pending) | Stops before the first ping, with a pop-up: `keepwarm stopped, the work looks finished (no pings)`. |
+| Haiku is unavailable or gives no clear answer | Keeps pinging: you asked for it. |
+| Your 5-hour or weekly limit reaches 93% (configurable) | Stops. If the work is unfinished, auto-compact's own limit trigger then compacts the chat. Starting keepwarm at the limit says why it won't. |
+| The window ends | Stops. The cache still has up to an hour; auto-compact then acts on it as usual. |
+| You come back and reply | Your reply refreshes the cache itself; keepwarm carries on until its window ends and judges the new reply before its next ping. |
+| A ping reads nothing, or writes a tenth or more of what it read | Stops: the cache was already gone and a rebuild was just paid; pinging on would pay it again. |
+| The API is busy (429, 5xx) | Retried after 1, 2 and 4 minutes while the cache can still be reached, then stops. |
+| The computer sleeps past the cache | Stops at wake-up, without a ping (a ping then would pay the rebuild). |
+| `/clear`, the chat closes, the app restarts | The window ends with its chat; start it again in the new one. |
+| The chat was just compacted, or you switched model | Waits for your next reply: the old cache is gone and the next reply writes the new one. |
+| API key, cloud provider or usage credits (5-minute cache) | Refuses to start: a ping every four minutes is not what this is for. |
+| Auto-compact | Does not compact a chat for its expiring cache while keepwarm holds it; its usage-limit trigger still applies. |
+
 ## Privacy
 
 - **The bar itself sends nothing anywhere.** Everything it shows is worked out on your computer.
 - **Auto-compact calls models by itself, unless you turn it off.** It sends Claude Haiku an abbreviated copy of the chat's last 30 messages (long ones cut, tool output left out) to judge whether the work is finished. If it is not, the chat is compacted exactly as `/compact` would: the chat's own model summarizes it.
+- **Keepwarm calls the chat's own model, only while a window you started runs.** Each ping is a fork of the chat with a fixed one-line prompt, sent to the same model and account as the chat itself; Haiku gets the same abbreviated copy as auto-compact's judgment.
+- **The question before an expensive message** is Claude Code's own dialog; nothing is sent.
 - **Two commands reach outside, when you run them:**
   - `/cmaxx-handoff` sends Claude Haiku an abbreviated copy of the chat (the last 120 messages, long ones cut, tool output left out). The briefing is saved in your project under `.claude/handoffs/`, which gets its own `.gitignore`, so briefings are never committed.
   - `/cmaxx-update` downloads this fork's version number (from `Mixonn/cache-maxxing`) and the price list (from the original `5m0k3/cache-maxxing`) and sends nothing. GitHub sees your IP address, as for any download.
@@ -183,6 +235,8 @@ What it costs: Haiku's judgment is a fraction of a cent. The compaction is done 
 - Auto-compact works only for chats open in a running app: a closed chat has no process to run it, and nothing runs while the computer sleeps. A chat that wakes up with an expired cache is left as it is.
 - At the usage-limit trigger, every open unfinished chat compacts at about the same time. Each costs about one normal message, and together they can use up what is left of the window.
 - "Finished" is Haiku's judgment of the last 30 messages. It can be wrong both ways: a finished chat compacted, or an unfinished one left to expire.
+- Keepwarm runs only while the app runs and the computer is awake, and its window lives in memory: a restart ends it.
+- How a ping's cache read counts against a subscription's 5-hour and weekly limits is not documented; the dollar figures are API list prices. Watch your usage during the first window.
 - If your organization blocks Haiku, `/cmaxx-handoff` writes a facts-only briefing that keeps your last message, and says why.
 - The handoff's saving is an estimate: Haiku's share and a fresh chat's start are taken from measured medians, priced as Claude Haiku 5.5.
 - Switching model and back within the hour shows "cache reset", although the first model's cache may still be warm.
@@ -191,7 +245,9 @@ What it costs: Haiku's judgment is a fraction of a cent. The compaction is done 
 
 ## FAQ
 
-**Does it cost anything to run?** The bar, no. `/cmaxx-handoff` makes one small Haiku call, typically about a cent at API prices.
+**Does it cost anything to run?** The bar, no. `/cmaxx-handoff` makes one small Haiku call, typically about a cent at API prices. Keepwarm costs one cache read per ping, about every 50 minutes, while you leave it on.
+
+**Is keepwarm allowed?** The original cache-maxxing left it out: Anthropic's Consumer Terms bar access by "automated or non-human means" unless via an API key or explicitly permitted. This fork adds it as something you start yourself, per chat, for a window you choose, through Claude Code's own plugin API, and it stops by itself. Whether that is within the terms is not settled here; it is your call, and Keepwarm stays off until you click it.
 
 **I'm on a subscription. Are the dollar amounts real?** They're API list prices, a way to compare. Set **Show cost as** to `times` to see "40× more" instead.
 

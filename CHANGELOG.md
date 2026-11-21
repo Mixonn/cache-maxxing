@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.8.0] - fork: keepwarm and a question before an expensive message
+
+### Added
+- **Keepwarm.** A **🔥 Keepwarm** button on the 🟢 and 🟡 bar asks for a window (8h first; 2h, 4h, 12h) and keeps the chat's cache warm while you are away: 10 minutes before the cache expires, one tool-less fork of the chat reads it, which restarts its hour. The bar shows `🔥 keepwarm 7h 09m left · 1 ping $0.06` and the button turns into **⏹ Stop keepwarm**. `/cmaxx-warm [3h|90m|off]` does the same from the prompt. Ported from karanb192/cache-tax (MIT).
+- Keepwarm stops by itself when Haiku judges the work finished, at the usage limit (5-hour or weekly, 93% by default), when its window ends, when a ping finds the cache already gone, or when the chat ends. A busy API is retried after 1, 2 and 4 minutes.
+- **A question before an expensive message.** Typing into a 🔴 chat, Claude Code's own dialog asks **Send anyway ($2.32)** or **Don't send**, with the rebuild's price and what a handoff would save. Closing the dialog drops the message once; the resend goes through. Ported from cache-tax.
+- Settings: **Before an expensive message** (`ask`/`warn`), **Keepwarm: default hours** (8), **Keepwarm: usage limit (%)** (93).
+- A `Keepwarm pings` row in `/cmaxx-stats`, with what they cost.
+
+### Changed
+- Haiku's "is the work finished?" is asked once per reply and shared by auto-compact and keepwarm.
+- Auto-compact does not compact a chat for its expiring cache while keepwarm holds it; its usage-limit trigger still applies.
+- Messages typed into a 🔴 chat are now held for the question by default. Set **Before an expensive message** to `warn` for the old pop-up.
+- The README's Usage table no longer breaks in two around the handoff button's paragraph.
+
 ## [0.7.2] - fork: auto-compact and stats in the desktop app
 
 ### Fixed

@@ -3,6 +3,8 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { Rec } from '../types'
+import { guardQuestion, isWarmPing, keepWarmStep, keepWarmStopped, parseWarmArg, pingUsd, warmChoices, warmLine } from '../hooks/logic'
+import type { Warm } from '../hooks/logic'
 import { DEFAULTS, HAIKU_ESTIMATE, autoCompactDue, autoCompactNotice, newerReading, parseJudgment, readSettings, PRICES_DATE, addStats, clock, costs, decide, emptyStats, fromSessionStart, handoffSaving, haikuUsd, money, newerVersion, priceOf, sendWarning, setFreshStart, setPriceOverride, statsFromTranscript, statsText, isDevCopy, isNewModel, sumStats, tokens, ttlFor, ttlFromUsage, validatePrices } from '../hooks/logic'
 import { savingsLine } from '../hooks/handoff'
 
@@ -204,7 +206,7 @@ test('the 🔴 tip and the handoff notice use one calculation: same figures when
 test('stats: counts add up, junk counts as empty, the table puts this chat and all chats side by side', () => {
   const now = Date.UTC(2026, 10, 17)
   expect(addStats({ replies: 'x' }, { replies: 1 }, now).replies).toBe(1)
-  const chat = addStats(addStats(undefined, { replies: 1, read: 90, write: 10 }, now), { rebuilds: 1, rebuildTokens: 228_000, rebuildUsd: 1.82, handoffs: 1, savedTokens: 183_000, savedUsd: 1.8175 }, now)
+  const chat = addStats(addStats(undefined, { replies: 1, read: 90, write: 10 }, now), { rebuilds: 1, rebuildTokens: 228_000, rebuildUsd: 1.82, handoffs: 1, savedTokens: 183_000, savedUsd: 1.8175, pings: 3, pingUsd: 0.15 }, now)
   const all = { ...addStats(chat, { replies: 4, read: 100 }, now), chats: 3 }
   expect(statsText(chat, all, DEFAULTS)).toBe([
     'cache-maxxing stats',
@@ -216,6 +218,7 @@ test('stats: counts add up, junk counts as empty, the table puts this chat and a
     '| Cache hit rate | 90% | 95% |',
     '| Handoffs | 1 | 1 |',
     '| Auto-compacts | 0 | 0 |',
+    '| Keepwarm pings | 3 ($0.15) | 3 ($0.15) |',
     '| Cold rebuilds paid | 1 (228K tokens, $1.82) | 1 (228K tokens, $1.82) |',
     '| Replies | 1 | 5 |',
     '| Chats | – | 3 |',
@@ -228,6 +231,7 @@ test('stats: counts add up, junk counts as empty, the table puts this chat and a
   const t = statsText(emptyStats(now), emptyStats(now), { ...DEFAULTS, costStyle: 'times' })
   expect(t.includes('$')).toBe(false)
   expect(t).toContain('| Cache hit rate | – | – |')
+  expect(t).toContain('| Keepwarm pings | 0 | 0 |')
 })
 
 // --- 0.4.0: transcript fill-in, /cmaxx-update ----------------------------------------
@@ -413,4 +417,96 @@ test('auto-compact: the notice says what happened, why, and how to turn it off',
 test('auto-compact: settings default to on, 5 minutes and 93%', async () => {
   expect(readSettings({})).toMatchObject({ autoCompact: true, autoCompactMinutes: 5, autoCompactLimitPercent: 93 })
   expect(readSettings({ autoCompact: 'off', autoCompactMinutes: 10, autoCompactLimitPercent: '80' })).toMatchObject({ autoCompact: false, autoCompactMinutes: 10, autoCompactLimitPercent: 80 })
+})
+
+test('auto-compact: keepwarm holds the cache, so only the limit trigger is left; a finished verdict is reused', async () => {
+  expect(autoCompactDue(rec(), at(5), S, null, true)).toBe(null)
+  expect(autoCompactDue(rec(), at(40), S, reading(94), true)).toBe('limit')
+  expect(autoCompactDue(rec({ finished: true }), at(5), S, null)).toBe(null)
+  expect(autoCompactDue(rec({ finished: false }), at(5), S, null)).toBe('cache')
+})
+
+// --- the cold-send guard (0.8.0) -----------------------------------------------------
+test('guard: asks only on the 🔴 bar, with the price on the send button', async () => {
+  expect(guardQuestion(rec(), at(10), S)).toBe(null) // warm
+  expect(guardQuestion(rec({ prefix: 20_000, read: 20_000 }), at(-60), S)).toBe(null) // 🟠: a cheap rebuild
+  const q = guardQuestion(rec(), at(-60), S)!
+  expect(q.send).toBe('Send anyway ($1.82)')
+  expect(q.question).toBe("cache-maxxing: this chat's cache expired 1h 00m ago, so this message rewrites 228K tokens ≈ $1.82 (a warm reply ≈ $0.05, 40× less). /cmaxx-handoff could save 170K tokens | $1.71 instead. Send it anyway?")
+})
+
+test('guard: the cause and the cost style change the wording', async () => {
+  expect(guardQuestion(rec({ resetBy: 'model' }), at(10), S)!.question).toMatch(/^cache-maxxing: the model changed, so this message rewrites 228K tokens/)
+  const t = guardQuestion(rec(), at(-5), { ...S, costStyle: 'times' })!
+  expect(t.send).toBe('Send anyway (40× more)')
+  expect(t.question).toBe("cache-maxxing: this chat's cache expired 5 min ago, so this message rewrites 228K tokens, about 40× a warm reply. /cmaxx-handoff could save 170K tokens instead. Send it anyway?")
+  expect(guardQuestion(rec({ model: 'claude-opus-9-9' }), at(-5), S)!.send).toBe('Send anyway') // no price
+})
+
+test('guard: settings default to ask; warn keeps the old pop-up', async () => {
+  expect(readSettings({}).sendGuard).toBe('ask')
+  expect(readSettings({ sendGuard: 'warn' }).sendGuard).toBe('warn')
+})
+
+// --- keepwarm (0.8.0) ------------------------------------------------------------------
+const warm = (over: Partial<Warm> = {}): Warm => ({ until: 8 * 60 * MIN, hours: 8, pings: 0, usd: 0, ...over })
+
+test('keepwarm: pings 10 minutes before the cache expires, after Haiku has judged the work', async () => {
+  expect(keepWarmStep(rec(), at(11), warm(), S, null)).toBe(null)
+  expect(keepWarmStep(rec(), at(10), warm(), S, null)).toBe('judge')
+  expect(keepWarmStep(rec({ finished: false }), at(10), warm(), S, null)).toBe('ping')
+  expect(keepWarmStep(rec({ finished: null }), at(10), warm(), S, null)).toBe('ping') // no judgment: the user asked for it, keep going
+  expect(keepWarmStep(null, at(10), warm(), S, null)).toBe(null)
+})
+
+test('keepwarm: stops when the work is finished, the window ends or the usage limit is near', async () => {
+  expect(keepWarmStep(rec({ finished: true }), at(10), warm(), S, null)).toEqual({ stop: 'the work looks finished' })
+  expect(keepWarmStep(rec(), 8 * 60 * MIN, warm(), S, null)).toEqual({ stop: 'its 8h window ended' })
+  expect(keepWarmStep(rec(), at(30), warm(), S, reading(93, undefined, 'seven_day'))).toEqual({ stop: 'your weekly usage limit is at 93%' })
+  expect(keepWarmStep(rec(), at(30), warm(), S, reading(100))).toEqual({ stop: 'your 5-hour usage limit is at 100%' })
+  expect(keepWarmStep(rec(), at(30), warm(), S, reading(92))).toBe(null)
+  expect(keepWarmStep(rec(), at(30), warm(), { ...S, keepWarmLimitPercent: 80 }, reading(85))).toEqual({ stop: 'your 5-hour usage limit is at 85%' })
+  expect(keepWarmStep(rec(), at(30), warm(), S, reading(99, new Date(at(31)).toISOString()))).toBe(null) // that window has reset since
+})
+
+test('keepwarm: never pings a cache that is gone, reset, about to expire or on the 5-minute lifetime', async () => {
+  expect(keepWarmStep(rec(), at(-1), warm(), S, null)).toEqual({ stop: 'the cache had already expired' })
+  expect(keepWarmStep(rec({ finished: false }), at(0.5), warm(), S, null)).toEqual({ stop: 'the cache had already expired' })
+  expect(keepWarmStep(rec({ resetBy: 'compact' }), at(10), warm(), S, null)).toBe(null) // waits for the next reply
+  expect(keepWarmStep(rec({ ttlMin: 5 }), 1 * MIN, warm(), S, null)).toEqual({ stop: 'it needs the 1-hour cache' })
+})
+
+test('keepwarm: a ping is warm when it read the cache and wrote under a tenth of it; priced at list rates', async () => {
+  expect(isWarmPing({ cache_read_input_tokens: 228_000, cache_creation_input_tokens: 2_000 })).toBe(true)
+  expect(isWarmPing({ cache_read_input_tokens: 0, cache_creation_input_tokens: 228_000 })).toBe(false)
+  expect(isWarmPing({ cache_read_input_tokens: 100_000, cache_creation_input_tokens: 10_000 })).toBe(false)
+  // 228K read at $0.20/M + 1K written at $8/M + 20 in at $4/M + 5 out at $20/M
+  const usd = pingUsd('claude-opus-5-5', { input_tokens: 20, output_tokens: 5, cache_read_input_tokens: 228_000, cache_creation_input_tokens: 1_000 })!
+  expect(Math.abs(usd - (0.0456 + 0.008 + 0.00008 + 0.0001)) < 1e-9).toBe(true)
+  expect(pingUsd('claude-opus-9-9', { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 1, cache_creation_input_tokens: 0 })).toBe(null)
+})
+
+test('keepwarm: the bar line, the window choices and the command argument', async () => {
+  expect(warmLine(warm(), 0)).toBe('🔥 keepwarm 8h 00m left')
+  expect(warmLine(warm({ pings: 2, usd: 0.1, lastPingUsd: 0.05 }), 7 * 60 * MIN + 30 * MIN)).toBe('🔥 keepwarm 30 min left · 2 pings $0.10')
+  expect(warmChoices(8)).toEqual(['8h', '2h', '4h', '12h'])
+  expect(warmChoices(6)).toEqual(['6h', '2h', '4h', '8h'])
+  expect(parseWarmArg('', 8)).toEqual({ ms: 8 * 60 * MIN })
+  expect(parseWarmArg('3h', 8)).toEqual({ ms: 3 * 60 * MIN })
+  expect(parseWarmArg('90m', 8)).toEqual({ ms: 90 * MIN })
+  expect(parseWarmArg('2h30m', 8)).toEqual({ ms: 150 * MIN })
+  expect(parseWarmArg('12', 8)).toEqual({ ms: 12 * 60 * MIN })
+  expect(parseWarmArg('off', 8)).toBe('off')
+  expect(parseWarmArg('stop', 8)).toBe('off')
+  expect(parseWarmArg('10m', 8)).toEqual({ error: 'a window from 30m to 48h, or off' })
+  expect(parseWarmArg('49h', 8)).toEqual({ error: 'a window from 30m to 48h, or off' })
+  expect(parseWarmArg('soon', 8)).toEqual({ error: 'a window from 30m to 48h, or off' })
+  expect(keepWarmStopped('the work looks finished', warm({ pings: 3, usd: 0.15 }))).toBe('cache-maxxing: keepwarm stopped, the work looks finished (3 pings, $0.15).')
+  expect(keepWarmStopped('you stopped it', warm())).toBe('cache-maxxing: keepwarm stopped, you stopped it (no pings).')
+})
+
+test('keepwarm: settings default to 8 hours and 93%', async () => {
+  expect(readSettings({})).toMatchObject({ keepWarmHours: 8, keepWarmLimitPercent: 93 })
+  expect(readSettings({ keepWarmHours: '4', keepWarmLimitPercent: 85 })).toMatchObject({ keepWarmHours: 4, keepWarmLimitPercent: 85 })
+  expect(readSettings({ keepWarmHours: 100 }).keepWarmHours).toBe(48)
 })
